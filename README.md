@@ -7,6 +7,11 @@
 项目适合需要把 Codex 接入飞书会话的场景。机器人支持会话记忆、交互卡片、
 风险审批、执行过程折叠面板、Markdown 回复区，以及本地 slash 命令。
 
+本项目基于原始项目
+[YUYU-gdx/feishu2codex](https://github.com/YUYU-gdx/feishu2codex)
+改造，主要增加了 Codex SDK 线程持久化、飞书审批、交互卡片时间线、
+Markdown 输出优化、slash 命令和通用安装文档。
+
 ## 功能
 
 核心功能包括以下部分。
