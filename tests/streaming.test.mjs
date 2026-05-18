@@ -142,7 +142,7 @@ test('completed card collapses execution process and command output is truncated
   assert.match(JSON.stringify(card), /truncated/);
 });
 
-test('card response uses markdown elements for inline code and fenced code', () => {
+test('card response renders inline code as Feishu text tags and keeps fenced code', () => {
   let state = createStreamState('查看命令');
   state = updateStreamState(state, {
     type: 'item.completed',
@@ -157,10 +157,10 @@ test('card response uses markdown elements for inline code and fenced code', () 
   const responseTitleIndex = card.elements.findIndex((item) => item.tag === 'markdown' && item.content === '**回复**');
   const responseContent = card.elements.slice(responseTitleIndex + 1).filter((item) => item.tag === 'markdown').map((item) => item.content).join('\n');
   assert.ok(responseTitleIndex > -1);
-  assert.match(responseContent, /Jenkins `eks-autotest` 当前命令/);
+  assert.match(responseContent, /Jenkins <text_tag color='grey'>eks-autotest<\/text_tag> 当前命令/);
   assert.match(responseContent, /```\ncodex exec --experimental-json/);
-  assert.match(responseContent, /`inline`/);
-  assert.doesNotMatch(responseContent, /```text/);
+  assert.match(responseContent, /<text_tag color='grey'>inline<\/text_tag>/);
+  assert.doesNotMatch(responseContent, /```text|`eks-autotest`|`inline`/);
 });
 
 test('redacts sensitive content', () => {

@@ -341,7 +341,33 @@ function buildMarkdownSection(title: string, text: unknown, limit: number) {
 }
 
 function normalizeMarkdownForCardView(text: string) {
-    return normalizeMarkdownForLark(text);
+    return renderInlineCodeTags(normalizeMarkdownForLark(text));
+}
+
+function renderInlineCodeTags(text: string) {
+    const fencePattern = /```[\s\S]*?```/g;
+    let cursor = 0;
+    let rendered = '';
+    for (const match of text.matchAll(fencePattern)) {
+        rendered += renderInlineCodeInText(text.slice(cursor, match.index));
+        rendered += match[0];
+        cursor = (match.index || 0) + match[0].length;
+    }
+    rendered += renderInlineCodeInText(text.slice(cursor));
+    return rendered;
+}
+
+function renderInlineCodeInText(text: string) {
+    return text.replace(/`([^`\n]{1,120})`/g, (_match, code) => {
+        return `<text_tag color='grey'>${escapeTextTagContent(String(code))}</text_tag>`;
+    });
+}
+
+function escapeTextTagContent(text: string) {
+    return text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
 }
 
 function splitMarkdownContent(text: string) {
