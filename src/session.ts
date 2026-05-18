@@ -1,0 +1,79 @@
+export type SessionRecord = {
+    session_key: string;
+    chat_id: string;
+    sender_open_id: string;
+    codex_thread_id: string;
+    first_message_id?: string;
+    last_message_id?: string;
+    title?: string;
+    updated_at: string;
+};
+
+export function makeSessionKey(chatId: string, senderOpenId: string) {
+    return `${chatId}:${senderOpenId || 'unknown'}`;
+}
+
+export function normalizeSessionMap(raw: unknown): Record<string, SessionRecord> {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        return {};
+    }
+
+    const records: Record<string, SessionRecord> = {};
+    for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+        if (typeof value === 'string') {
+            records[key] = {
+                session_key: key,
+                chat_id: key,
+                sender_open_id: 'unknown',
+                codex_thread_id: value,
+                updated_at: new Date(0).toISOString(),
+            };
+            continue;
+        }
+        if (!value || typeof value !== 'object') {
+            continue;
+        }
+        const item = value as Partial<SessionRecord>;
+        if (!item.codex_thread_id) {
+            continue;
+        }
+        records[item.session_key || key] = {
+            session_key: item.session_key || key,
+            chat_id: item.chat_id || key.split(':')[0] || key,
+            sender_open_id: item.sender_open_id || key.split(':')[1] || 'unknown',
+            codex_thread_id: item.codex_thread_id,
+            first_message_id: item.first_message_id,
+            last_message_id: item.last_message_id,
+            title: item.title,
+            updated_at: item.updated_at || new Date().toISOString(),
+        };
+    }
+    return records;
+}
+
+export function buildSessionRecord(params: {
+    sessionKey: string;
+    chatId: string;
+    senderOpenId: string;
+    threadId: string;
+    previous?: SessionRecord;
+    messageId?: string;
+    userText?: string;
+}): SessionRecord {
+    return {
+        session_key: params.sessionKey,
+        chat_id: params.chatId,
+        sender_open_id: params.senderOpenId,
+        codex_thread_id: params.threadId,
+        first_message_id: params.previous?.first_message_id || params.messageId,
+        last_message_id: params.messageId || params.previous?.last_message_id,
+        title: params.previous?.title || titleFromText(params.userText || ''),
+        updated_at: new Date().toISOString(),
+    };
+}
+
+function titleFromText(text: string) {
+    const normalized = text.replace(/\s+/g, ' ').trim();
+    if (!normalized) return undefined;
+    return normalized.length <= 60 ? normalized : `${normalized.slice(0, 57)}...`;
+}
