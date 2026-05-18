@@ -17,6 +17,21 @@ test('normalizes legacy bot_sessions string values', () => {
   assert.equal(sessions['chat-a'].sender_open_id, 'unknown');
 });
 
+test('normalizes model-only session preferences', () => {
+  const sessions = normalizeSessionMap({
+    'chat-a:open-a': {
+      session_key: 'chat-a:open-a',
+      chat_id: 'chat-a',
+      sender_open_id: 'open-a',
+      model: 'gpt-5.4',
+      reasoning_effort: 'high',
+    },
+  });
+  assert.equal(sessions['chat-a:open-a'].model, 'gpt-5.4');
+  assert.equal(sessions['chat-a:open-a'].reasoning_effort, 'high');
+  assert.equal(sessions['chat-a:open-a'].codex_thread_id, undefined);
+});
+
 test('builds structured session record without losing first message', () => {
   const first = buildSessionRecord({
     sessionKey: 'chat:open',
@@ -39,4 +54,25 @@ test('builds structured session record without losing first message', () => {
   assert.equal(second.first_message_id, 'msg-1');
   assert.equal(second.last_message_id, 'msg-2');
   assert.equal(second.title.length, 60);
+});
+
+test('builds session record without losing selected model', () => {
+  const first = buildSessionRecord({
+    sessionKey: 'chat:open',
+    chatId: 'chat',
+    senderOpenId: 'open',
+    threadId: 'thread-1',
+    model: 'gpt-5.4',
+    reasoningEffort: 'high',
+  });
+  const second = buildSessionRecord({
+    sessionKey: 'chat:open',
+    chatId: 'chat',
+    senderOpenId: 'open',
+    threadId: 'thread-2',
+    previous: first,
+  });
+
+  assert.equal(second.model, 'gpt-5.4');
+  assert.equal(second.reasoning_effort, 'high');
 });

@@ -33,9 +33,47 @@ export function slashHelpText() {
         '/interrupt <task> 打断当前任务并执行新任务',
         '/cancel <task_id> 取消等待任务',
         '/clear-queue 清空当前会话等待队列',
-        '/reset 清空当前会话记忆',
+        '/model [model_name] [reasoning_effort] 查看或切换当前会话模型',
+        '/reset 开启新对话，不删除本机历史文件',
         '/status 查看机器人状态',
     ].join('\n');
+}
+
+export function parseModelSelection(args: string) {
+    const parts = args.trim().split(/\s+/).filter(Boolean);
+    if (parts.length === 0) return { model: null, reasoningEffort: null };
+
+    let reasoningEffort: string | null = null;
+    const last = parts[parts.length - 1].toLowerCase();
+    if (isReasoningEffort(last)) {
+        reasoningEffort = last;
+        parts.pop();
+    }
+
+    const model = parts.length > 0 ? parts.join('-') : null;
+    return { model, reasoningEffort };
+}
+
+export function formatModelStatus(
+    currentModel: string | null | undefined,
+    defaultModel: string | null | undefined,
+    currentReasoningEffort: string | null | undefined,
+    defaultReasoningEffort: string | null | undefined,
+) {
+    return [
+        'Codex 模型',
+        '',
+        `当前模型: ${currentModel || defaultModel || 'Codex CLI 默认模型'}`,
+        `默认模型: ${defaultModel || 'Codex CLI 默认模型'}`,
+        `当前 Reasoning effort: ${currentReasoningEffort || defaultReasoningEffort || 'Codex CLI 默认值'}`,
+        `默认 Reasoning effort: ${defaultReasoningEffort || 'Codex CLI 默认值'}`,
+        '',
+        '切换用法: /model <model_name> [minimal|low|medium|high|xhigh]',
+    ].join('\n');
+}
+
+function isReasoningEffort(value: string) {
+    return ['minimal', 'low', 'medium', 'high', 'xhigh'].includes(value);
 }
 
 export function defaultSkillRoots() {

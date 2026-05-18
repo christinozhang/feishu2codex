@@ -32,7 +32,9 @@ import {
 } from './queue.js';
 import {
     approvalSummaryText,
+    formatModelStatus,
     formatSkills,
+    parseModelSelection,
     parseSlashCommand,
     rewriteSkillPrompt,
     runMcpList,
@@ -55,6 +57,8 @@ type ThreadCache = {
     thread: Thread;
     sandboxMode: string;
     approvalPolicy: string;
+    model?: string;
+    reasoningEffort?: string;
 };
 
 type ApprovalRequest = {
@@ -318,6 +322,25 @@ async function handleSlashCommand(userText: string, params: {
         await replyText(params.messageId, approvalSummaryText());
         return { handled: true };
     }
+    if (command.name === 'model') {
+        const selection = parseModelSelection(command.args);
+        if (selection.model === null && selection.reasoningEffort === null) {
+            await replyText(params.messageId, formatModelStatus(
+                getSessionModel(params.sessionKey),
+                getDefaultModel(),
+                getSessionReasoningEffort(params.sessionKey),
+                getDefaultReasoningEffort(),
+            ));
+            return { handled: true };
+        }
+        setSessionModelConfig(params.sessionKey, selection.model, selection.reasoningEffort);
+        await replyText(params.messageId, [
+            '当前会话 Codex 配置已更新:',
+            `模型: ${getSessionModel(params.sessionKey) || 'Codex CLI 默认模型'}`,
+            `Reasoning effort: ${getSessionReasoningEffort(params.sessionKey) || 'Codex CLI 默认值'}`,
+        ].join('\n'));
+        return { handled: true };
+    }
     if (command.name === 'queue') {
         const runner = getOrCreateRunner(sessionRunners, params.sessionKey);
         const snapshot = snapshotRunner(runner);
@@ -349,11 +372,9 @@ async function handleSlashCommand(userText: string, params: {
         return { handled: false, userText: taskText.text, interrupt: true };
     }
     if (command.name === 'reset' || command.name === 'clear') {
-        delete sessionMap[params.sessionKey];
-        threadMap.delete(params.sessionKey);
-        saveSessions();
+        resetSessionThread(params.sessionKey);
         updateStats({ sessions: Object.keys(sessionMap).length });
-        await replyText(params.messageId, '已清空当前会话记忆。');
+        await replyText(params.messageId, '已开启新对话。当前 Codex thread 绑定已移除，本机历史文件不会删除。');
         return { handled: true };
     }
     if (command.name === 'status') {
@@ -712,16 +733,19 @@ function runtimeCardOptions(params: {
 
 async function getOrCreateThread(sessionKey: string, policy: { sandboxMode: string; approvalPolicy: string }): Promise<Thread> {
     const cached = threadMap.get(sessionKey);
-    if (cached && cached.sandboxMode === policy.sandboxMode && cached.approvalPolicy === policy.approvalPolicy) {
+    const model = getSessionModel(sessionKey);
+    const reasoningEffort = getSessionReasoningEffort(sessionKey);
+    if (cached && cached.sandboxMode === policy.sandboxMode && cached.approvalPolicy === policy.approvalPolicy && cached.model === model && cached.reasoningEffort === reasoningEffort) {
         return cached.thread;
     }
 
     const existingThreadId = sessionMap[sessionKey]?.codex_thread_id;
     const threadOptions = {
+        model,
         skipGitRepoCheck: getBool('CODEX_SKIP_GIT_CHECK', true),
         sandboxMode: policy.sandboxMode as any,
         approvalPolicy: policy.approvalPolicy as any,
-        modelReasoningEffort: (process.env.CODEX_REASONING_EFFORT || 'medium') as any,
+        modelReasoningEffort: reasoningEffort as any,
         webSearchEnabled: getBool('CODEX_WEB_SEARCH_ENABLED', true),
         workingDirectory: getWorkingDirectory(),
     };
@@ -740,7 +764,7 @@ async function getOrCreateThread(sessionKey: string, policy: { sandboxMode: stri
         thread = codex.startThread(threadOptions);
     }
 
-    threadMap.set(sessionKey, { thread, sandboxMode: policy.sandboxMode, approvalPolicy: policy.approvalPolicy });
+    threadMap.set(sessionKey, { thread, sandboxMode: policy.sandboxMode, approvalPolicy: policy.approvalPolicy, model, reasoningEffort });
     return thread;
 }
 
@@ -760,6 +784,8 @@ async function rememberThread(params: {
         chatId: params.chatId,
         senderOpenId: params.senderOpenId,
         threadId: thread.id,
+        model: getSessionModel(params.sessionKey),
+        reasoningEffort: getSessionReasoningEffort(params.sessionKey),
         previous,
         messageId: params.sourceMessageId,
         userText: params.userText,
@@ -771,6 +797,60 @@ async function rememberThread(params: {
 
 function getWorkingDirectory() {
     return path.resolve(process.env.CODEX_WORKING_DIRECTORY || DEFAULT_WORKDIR);
+}
+
+function getDefaultModel() {
+    return process.env.CODEX_MODEL?.trim() || undefined;
+}
+
+function getDefaultReasoningEffort() {
+    return process.env.CODEX_REASONING_EFFORT?.trim() || 'medium';
+}
+
+function getSessionModel(sessionKey: string) {
+    return sessionMap[sessionKey]?.model || getDefaultModel();
+}
+
+function getSessionReasoningEffort(sessionKey: string) {
+    return sessionMap[sessionKey]?.reasoning_effort || getDefaultReasoningEffort();
+}
+
+function setSessionModelConfig(sessionKey: string, model: string | null, reasoningEffort: string | null) {
+    const previous = sessionMap[sessionKey];
+    sessionMap[sessionKey] = {
+        session_key: sessionKey,
+        chat_id: previous?.chat_id || sessionKey.split(':')[0] || sessionKey,
+        sender_open_id: previous?.sender_open_id || sessionKey.split(':')[1] || 'unknown',
+        codex_thread_id: previous?.codex_thread_id,
+        model: model || previous?.model,
+        reasoning_effort: reasoningEffort || previous?.reasoning_effort,
+        first_message_id: previous?.first_message_id,
+        last_message_id: previous?.last_message_id,
+        title: previous?.title,
+        updated_at: new Date().toISOString(),
+    };
+    threadMap.delete(sessionKey);
+    saveSessions();
+    updateStats({ sessions: Object.keys(sessionMap).length });
+}
+
+function resetSessionThread(sessionKey: string) {
+    const previous = sessionMap[sessionKey];
+    threadMap.delete(sessionKey);
+    if (!previous?.model && !previous?.reasoning_effort) {
+        delete sessionMap[sessionKey];
+        saveSessions();
+        return;
+    }
+    sessionMap[sessionKey] = {
+        session_key: sessionKey,
+        chat_id: previous.chat_id,
+        sender_open_id: previous.sender_open_id,
+        model: previous.model,
+        reasoning_effort: previous.reasoning_effort,
+        updated_at: new Date().toISOString(),
+    };
+    saveSessions();
 }
 
 function createApprovalId() {

@@ -4,8 +4,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
+  formatModelStatus,
   formatSkills,
   listSkills,
+  parseModelSelection,
   parseSlashCommand,
   rewriteSkillPrompt,
   slashHelpText,
@@ -27,6 +29,8 @@ test('help text includes supported commands', () => {
   assert.match(help, /\/interrupt <task>/);
   assert.match(help, /\/cancel <task_id>/);
   assert.match(help, /\/clear-queue/);
+  assert.match(help, /\/model/);
+  assert.match(help, /开启新对话/);
 });
 
 test('lists skills with SKILL.md and filters by keyword', () => {
@@ -50,4 +54,18 @@ test('rewrites existing skill prompt and rejects missing skill', () => {
 
   const missing = rewriteSkillPrompt('missing task', [root]);
   assert.match(missing.error, /不存在/);
+});
+
+test('parses model slash command and formats current model', () => {
+  assert.deepEqual(parseModelSelection(' gpt-5.4 '), { model: 'gpt-5.4', reasoningEffort: null });
+  assert.deepEqual(parseModelSelection('gpt-5.5 medium'), { model: 'gpt-5.5', reasoningEffort: 'medium' });
+  assert.deepEqual(parseModelSelection('gpt 5.5 high'), { model: 'gpt-5.5', reasoningEffort: 'high' });
+  assert.deepEqual(parseModelSelection('high'), { model: null, reasoningEffort: 'high' });
+  assert.deepEqual(parseModelSelection(''), { model: null, reasoningEffort: null });
+
+  const status = formatModelStatus('gpt-5.4', 'gpt-5.5', 'high', 'medium');
+  assert.match(status, /当前模型: gpt-5.4/);
+  assert.match(status, /默认模型: gpt-5.5/);
+  assert.match(status, /当前 Reasoning effort: high/);
+  assert.match(status, /默认 Reasoning effort: medium/);
 });
