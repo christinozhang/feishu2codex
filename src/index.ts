@@ -9,12 +9,27 @@ import { buildSessionRecord, makeSessionKey, normalizeSessionMap, SessionRecord 
 import { startWebServer, updateStats, addLog } from './server.js';
 import {
     buildAgentCard,
+    buildQueueSummaryCard,
+    buildQueuedTaskCard,
     createApprovalState,
     createStreamState,
     formatStreamState,
+    markStreamInterrupted,
+    RuntimeCardOptions,
     shouldUpdateCard,
     updateStreamState,
 } from './streaming.js';
+import {
+    canOperateTask,
+    clearQueuedTasks,
+    createQueuedTask,
+    getOrCreateRunner,
+    moveQueuedTaskToFront,
+    QueuedTask,
+    removeQueuedTask,
+    SessionRunner,
+    snapshotRunner,
+} from './queue.js';
 import {
     approvalSummaryText,
     formatSkills,
@@ -91,7 +106,7 @@ if (process.env.CODEX_CONFIG_DIR_OVERRIDE?.trim()) {
 const codexPathOverride = process.env.CODEX_PATH_OVERRIDE || process.env.CODEX_BIN || undefined;
 const codex = new Codex({ env: codexEnv, codexPathOverride });
 const threadMap = new Map<string, ThreadCache>();
-const activeSessions = new Set<string>();
+const sessionRunners = new Map<string, SessionRunner>();
 const pendingApprovals = new Map<string, ApprovalRequest>();
 const processedMessages = new Set<string>();
 const MAX_PROCESSED_MESSAGES = 1000;
@@ -243,18 +258,23 @@ async function handleMessageEvent(data: any) {
             return;
         }
 
-        const slashResult = await handleSlashCommand(userText, message_id, sessionKey);
+        const slashResult = await handleSlashCommand(userText, {
+            messageId: message_id,
+            sessionKey,
+            senderOpenId,
+        });
         if (slashResult.handled) {
             recordHandledMessage();
             return;
         }
 
-        await executeUserTask({
+        await enqueueUserTask({
             chatId: chat_id,
             senderOpenId,
             sessionKey,
             sourceMessageId: message_id,
             userText: slashResult.userText || userText,
+            mode: slashResult.interrupt ? 'interrupt' : 'normal',
         });
         recordHandledMessage();
     } catch (err) {
@@ -265,45 +285,79 @@ async function handleMessageEvent(data: any) {
     }
 }
 
-async function handleSlashCommand(userText: string, messageId: string, sessionKey: string) {
+async function handleSlashCommand(userText: string, params: {
+    messageId: string;
+    sessionKey: string;
+    senderOpenId: string;
+}) {
     const command = parseSlashCommand(userText);
     if (!command) return { handled: false };
 
     if (command.name === 'skill') {
         const result = rewriteSkillPrompt(command.args);
         if (result.error) {
-            await replyText(messageId, result.error);
+            await replyText(params.messageId, result.error);
             return { handled: true };
         }
         return { handled: false, userText: result.text };
     }
 
     if (command.name === 'help') {
-        await replyText(messageId, slashHelpText());
+        await replyText(params.messageId, slashHelpText());
         return { handled: true };
     }
     if (command.name === 'skills') {
-        await replyText(messageId, formatSkills(command.args));
+        await replyText(params.messageId, formatSkills(command.args));
         return { handled: true };
     }
     if (command.name === 'mcp') {
-        await replyText(messageId, runMcpList());
+        await replyText(params.messageId, runMcpList());
         return { handled: true };
     }
     if (command.name === 'approval') {
-        await replyText(messageId, approvalSummaryText());
+        await replyText(params.messageId, approvalSummaryText());
         return { handled: true };
     }
+    if (command.name === 'queue') {
+        const runner = getOrCreateRunner(sessionRunners, params.sessionKey);
+        const snapshot = snapshotRunner(runner);
+        await replyInteractiveCard(params.messageId, buildQueueSummaryCard({
+            sessionKey: params.sessionKey,
+            currentTask: snapshot.current,
+            queue: snapshot.queue,
+        }), formatQueueAsText(snapshot.current, snapshot.queue));
+        return { handled: true };
+    }
+    if (command.name === 'cancel') {
+        const runner = getOrCreateRunner(sessionRunners, params.sessionKey);
+        const removed = removeQueuedTask(runner, command.args.trim(), params.senderOpenId);
+        await replyText(params.messageId, removed ? `已取消排队任务: ${removed.id}` : '未找到可取消的等待任务。');
+        return { handled: true };
+    }
+    if (command.name === 'clear-queue') {
+        const runner = getOrCreateRunner(sessionRunners, params.sessionKey);
+        const count = clearQueuedTasks(runner, params.senderOpenId);
+        await replyText(params.messageId, `已清空 ${count} 条等待任务。`);
+        return { handled: true };
+    }
+    if (command.name === 'interrupt') {
+        const taskText = rewriteExecutableSlash(command.args);
+        if (taskText.error) {
+            await replyText(params.messageId, taskText.error);
+            return { handled: true };
+        }
+        return { handled: false, userText: taskText.text, interrupt: true };
+    }
     if (command.name === 'reset' || command.name === 'clear') {
-        delete sessionMap[sessionKey];
-        threadMap.delete(sessionKey);
+        delete sessionMap[params.sessionKey];
+        threadMap.delete(params.sessionKey);
         saveSessions();
         updateStats({ sessions: Object.keys(sessionMap).length });
-        await replyText(messageId, '已清空当前会话记忆。');
+        await replyText(params.messageId, '已清空当前会话记忆。');
         return { handled: true };
     }
     if (command.name === 'status') {
-        await replyText(messageId, [
+        await replyText(params.messageId, [
             '机器人状态',
             '',
             '状态: 运行中',
@@ -316,57 +370,163 @@ async function handleSlashCommand(userText: string, messageId: string, sessionKe
         return { handled: true };
     }
 
-    await replyText(messageId, slashHelpText());
+    await replyText(params.messageId, slashHelpText());
     return { handled: true };
 }
 
-async function executeUserTask(params: {
+function rewriteExecutableSlash(text: string): { text?: string; error?: string } {
+    const trimmed = text.trim();
+    if (!trimmed) return { error: '用法: /interrupt <task>' };
+    const nested = parseSlashCommand(trimmed);
+    if (!nested) return { text: trimmed };
+    if (nested.name === 'skill') {
+        return rewriteSkillPrompt(nested.args);
+    }
+    return { error: '只有 /skill 可以作为 /interrupt 的嵌套命令。' };
+}
+
+function formatQueueAsText(current: QueuedTask | null, queue: QueuedTask[]) {
+    const lines = [
+        'Codex 队列',
+        '',
+        `当前运行: ${current ? current.userText : '无'}`,
+        '',
+        '等待队列:',
+    ];
+    if (queue.length === 0) {
+        lines.push('无等待任务');
+    } else {
+        lines.push(...queue.slice(0, 10).map((task, index) => `${index + 1}. ${task.id} ${task.userText}`));
+    }
+    if (queue.length > 10) lines.push(`还有 ${queue.length - 10} 条未展示。`);
+    return lines.join('\n');
+}
+
+async function enqueueUserTask(params: {
     chatId: string;
     senderOpenId: string;
     sessionKey: string;
     sourceMessageId: string;
     userText: string;
+    mode: 'normal' | 'interrupt';
 }) {
-    if (activeSessions.has(params.sessionKey)) {
-        await replyText(params.sourceMessageId, '当前会话已有任务在执行。');
+    const runner = getOrCreateRunner(sessionRunners, params.sessionKey);
+    const task = createQueuedTask(params);
+
+    if (params.mode === 'interrupt') {
+        enqueueTaskFront(runner, task);
+        const interrupted = interruptRunner(runner, params.senderOpenId);
+        if (!interrupted && !runner.draining) void drainSessionQueue(runner);
+        await replyInteractiveCard(params.sourceMessageId, buildQueuedTaskCard({
+            task,
+            position: 1,
+            queueLength: runner.queue.length,
+            currentTask: runner.current,
+        }), `已加入队列: ${task.id}`);
         return;
     }
 
-    activeSessions.add(params.sessionKey);
+    const idle = !runner.current && !runner.draining;
+    const position = enqueueTaskBack(runner, task);
+    if (!idle) {
+        await replyInteractiveCard(params.sourceMessageId, buildQueuedTaskCard({
+            task,
+            position,
+            queueLength: runner.queue.length,
+            currentTask: runner.current,
+        }), `已加入队列: ${task.id}`);
+        return;
+    }
+
+    void drainSessionQueue(runner);
+}
+
+async function drainSessionQueue(runner: SessionRunner) {
+    if (runner.draining) return;
+    runner.draining = true;
     try {
-        const needsApproval = FEISHU_APPROVAL_ENABLED && requiresFeishuApproval(params.userText);
+        while (runner.queue.length > 0) {
+            const task = runner.queue.shift();
+            if (!task) continue;
+            runner.current = task;
+            runner.abortController = new AbortController();
+            runner.interrupted = false;
+            await runUserTaskNow(runner, task);
+            runner.current = null;
+            runner.abortController = null;
+            runner.interrupted = false;
+        }
+    } finally {
+        runner.draining = false;
+        if (!runner.current && runner.queue.length === 0) {
+            sessionRunners.delete(runner.sessionKey);
+        }
+    }
+}
+
+async function runUserTaskNow(runner: SessionRunner, task: QueuedTask) {
+    try {
+        const needsApproval = FEISHU_APPROVAL_ENABLED && requiresFeishuApproval(task.userText);
         let privileged = false;
         let targetMessageId: string | null = null;
 
         if (needsApproval) {
             const approvalId = createApprovalId();
-            const approvalState = createApprovalState(params.userText, approvalId, [
+            task.approvalId = approvalId;
+            const approvalState = createApprovalState(task.userText, approvalId, [
                 `Sandbox: ${getRunPolicy(true).sandboxMode}`,
                 `Approval policy: ${getRunPolicy(true).approvalPolicy}`,
                 `Workdir: ${getWorkingDirectory()}`,
                 `文本审批: approve ${approvalId} / deny ${approvalId}`,
             ].join('\n'));
-            targetMessageId = await replyInteractive(params.sourceMessageId, approvalState);
-            const approved = await waitForApproval(approvalId, params.senderOpenId);
+            targetMessageId = await replyInteractive(task.sourceMessageId, approvalState);
+            task.targetMessageId = targetMessageId;
+            const approved = await waitForApproval(approvalId, task.senderOpenId);
+            task.approvalId = undefined;
             if (!approved) {
-                const failedState = updateStreamState(approvalState, {
-                    type: 'error',
-                    message: '飞书审批未通过或超时，Codex 未启动。',
-                });
-                await updateInteractiveOrText(params.sourceMessageId, targetMessageId, failedState);
+                const failedState = runner.interrupted
+                    ? markStreamInterrupted(approvalState, '审批等待期间任务已被打断，Codex 未启动。')
+                    : updateStreamState(approvalState, {
+                        type: 'error',
+                        message: '飞书审批未通过或超时，Codex 未启动。',
+                    });
+                await updateInteractiveOrText(task.sourceMessageId, targetMessageId, failedState);
                 return;
             }
             privileged = true;
         }
 
         await runCodexStreamToFeishu({
-            ...params,
+            ...task,
             targetMessageId,
             privileged,
+            signal: runner.abortController?.signal,
+            isInterrupted: () => runner.interrupted,
         });
-    } finally {
-        activeSessions.delete(params.sessionKey);
+    } catch (err) {
+        console.error('执行队列任务出错:', err);
+        addLog('error', `执行队列任务出错: ${err instanceof Error ? err.message : String(err)}`);
     }
+}
+
+function enqueueTaskBack(runner: SessionRunner, task: QueuedTask) {
+    runner.queue.push(task);
+    return runner.queue.length;
+}
+
+function enqueueTaskFront(runner: SessionRunner, task: QueuedTask) {
+    runner.queue.unshift(task);
+}
+
+function interruptRunner(runner: SessionRunner, requesterOpenId: string) {
+    if (!runner.current || !canOperateTask(runner.current, requesterOpenId)) return false;
+    runner.interrupted = true;
+    if (runner.current.approvalId) {
+        const approval = pendingApprovals.get(runner.current.approvalId);
+        if (approval) finishApproval(approval, false, requesterOpenId);
+    }
+    runner.abortController?.abort();
+    return true;
 }
 
 async function waitForApproval(approvalId: string, requesterOpenId: string) {
@@ -393,16 +553,70 @@ async function handleTextApproval(userText: string, messageId: string, senderOpe
 }
 
 async function handleCardAction(data: any) {
-    console.log('[审批] received Feishu card action');
+    console.log('[卡片] received Feishu card action');
     const value = data.action?.value || data.event?.action?.value || data.value || {};
     const approvalId = value.approval_id || value.approvalId;
     const action = value.action;
     const senderOpenId = data.operator?.open_id || data.operator?.user_id || data.event?.operator?.open_id || 'unknown';
-    const approval = pendingApprovals.get(approvalId);
-    if (!approval) return undefined;
 
-    finishApproval(approval, action === 'approve', senderOpenId);
+    if (action === 'approve' || action === 'deny') {
+        const approval = pendingApprovals.get(approvalId);
+        if (!approval) return undefined;
+        finishApproval(approval, action === 'approve', senderOpenId);
+        return undefined;
+    }
+
+    await handleQueueCardAction(action, value, senderOpenId);
     return undefined;
+}
+
+async function handleQueueCardAction(action: string, value: any, senderOpenId: string) {
+    const sessionKey = value.session_key || value.sessionKey;
+    const taskId = value.task_id || value.taskId;
+    const requesterOpenId = value.requester_open_id || value.requesterOpenId || senderOpenId;
+    const sourceMessageId = value.source_message_id || value.sourceMessageId;
+    if (!sessionKey) return;
+
+    const runner = getOrCreateRunner(sessionRunners, sessionKey);
+    if (requesterOpenId !== 'unknown' && senderOpenId !== 'unknown' && requesterOpenId !== senderOpenId) {
+        if (sourceMessageId) await replyText(sourceMessageId, '只有任务发起人可以操作此队列任务。');
+        return;
+    }
+
+    if (action === 'interrupt_current') {
+        const interrupted = interruptRunner(runner, senderOpenId);
+        if (sourceMessageId) await replyText(sourceMessageId, interrupted ? '已请求打断当前任务。' : '没有可打断的当前任务。');
+        return;
+    }
+
+    if (action === 'interrupt_with_task') {
+        const moved = moveQueuedTaskToFront(runner, taskId, senderOpenId);
+        if (!moved) {
+            if (sourceMessageId) await replyText(sourceMessageId, '未找到可插队的等待任务。');
+            return;
+        }
+        const interrupted = interruptRunner(runner, senderOpenId);
+        if (!interrupted && !runner.draining) void drainSessionQueue(runner);
+        if (sourceMessageId) await replyText(sourceMessageId, `任务已移到队首: ${moved.id}`);
+        return;
+    }
+
+    if (action === 'cancel_queued_task') {
+        const removed = removeQueuedTask(runner, taskId, senderOpenId);
+        if (sourceMessageId) await replyText(sourceMessageId, removed ? `已取消排队任务: ${removed.id}` : '未找到可取消的等待任务。');
+        return;
+    }
+
+    if (action === 'show_queue') {
+        const snapshot = snapshotRunner(runner);
+        if (sourceMessageId) {
+            await replyInteractiveCard(sourceMessageId, buildQueueSummaryCard({
+                sessionKey,
+                currentTask: snapshot.current,
+                queue: snapshot.queue,
+            }), formatQueueAsText(snapshot.current, snapshot.queue));
+        }
+    }
 }
 
 function finishApproval(approval: ApprovalRequest, approved: boolean, senderOpenId: string) {
@@ -421,15 +635,19 @@ async function runCodexStreamToFeishu(params: {
     sessionKey: string;
     sourceMessageId: string;
     userText: string;
+    id: string;
     privileged: boolean;
     targetMessageId: string | null;
+    signal?: AbortSignal;
+    isInterrupted: () => boolean;
 }) {
     const policy = getRunPolicy(params.privileged);
     const thread = await getOrCreateThread(params.sessionKey, policy);
     let state = createStreamState(params.userText);
-    const targetMessageId = params.targetMessageId || await replyInteractive(params.sourceMessageId, state);
+    const cardOptions = runtimeCardOptions(params);
+    const targetMessageId = params.targetMessageId || await replyInteractive(params.sourceMessageId, state, cardOptions);
     if (params.targetMessageId) {
-        await updateInteractiveOrText(params.sourceMessageId, targetMessageId, state);
+        await updateInteractiveOrText(params.sourceMessageId, targetMessageId, state, cardOptions);
     }
     let lastState = state;
     let lastResponseLength = 0;
@@ -437,7 +655,7 @@ async function runCodexStreamToFeishu(params: {
 
     try {
         console.log('[Codex] 正在请求 Codex...');
-        const { events } = await thread.runStreamed(params.userText);
+        const { events } = await thread.runStreamed(params.userText, { signal: params.signal });
 
         for await (const event of events) {
             const nextState = updateStreamState(state, event);
@@ -445,7 +663,7 @@ async function runCodexStreamToFeishu(params: {
 
             const now = Date.now();
             if (shouldUpdateCard(state, nextState, lastResponseLength) && now - lastUpdateAt >= 1500) {
-                await updateInteractiveOrText(params.sourceMessageId, targetMessageId, nextState);
+                await updateInteractiveOrText(params.sourceMessageId, targetMessageId, nextState, runtimeCardOptions(params));
                 lastState = nextState;
                 lastResponseLength = nextState.responseText.length;
                 lastUpdateAt = now;
@@ -454,18 +672,42 @@ async function runCodexStreamToFeishu(params: {
         }
 
         await rememberThread(params, thread);
+        if (params.isInterrupted()) {
+            state = markStreamInterrupted(state);
+        }
     } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        state = updateStreamState(state, { type: 'error', message });
-        console.error('Codex 流式处理出错:', err);
-        addLog('error', `Codex 流式处理出错: ${message}`);
+        if (params.isInterrupted()) {
+            state = markStreamInterrupted(state);
+            addLog('info', `任务已被打断: ${params.id}`);
+        } else {
+            const message = err instanceof Error ? err.message : String(err);
+            state = updateStreamState(state, { type: 'error', message });
+            console.error('Codex 流式处理出错:', err);
+            addLog('error', `Codex 流式处理出错: ${message}`);
+        }
     } finally {
         if (JSON.stringify(state) !== JSON.stringify(lastState)) {
-            await updateInteractiveOrText(params.sourceMessageId, targetMessageId, state);
+            await updateInteractiveOrText(params.sourceMessageId, targetMessageId, state, runtimeCardOptions(params));
         }
     }
 
     console.log(`[Codex 回复] ${state.responseText.substring(0, 50)}...`);
+}
+
+function runtimeCardOptions(params: {
+    id: string;
+    sessionKey: string;
+    senderOpenId: string;
+    sourceMessageId: string;
+}): RuntimeCardOptions {
+    return {
+        includeApprovalButtons: FEISHU_APPROVAL_BUTTONS_ENABLED,
+        includeRuntimeButtons: true,
+        sessionKey: params.sessionKey,
+        taskId: params.id,
+        requesterOpenId: params.senderOpenId,
+        sourceMessageId: params.sourceMessageId,
+    };
 }
 
 async function getOrCreateThread(sessionKey: string, policy: { sandboxMode: string; approvalPolicy: string }): Promise<Thread> {
@@ -551,38 +793,55 @@ async function replyText(messageId: string, text: string): Promise<string | null
     }
 }
 
-async function replyInteractive(messageId: string, state: ReturnType<typeof createStreamState>): Promise<string | null> {
+async function replyInteractive(
+    messageId: string,
+    state: ReturnType<typeof createStreamState>,
+    options: RuntimeCardOptions = { includeApprovalButtons: FEISHU_APPROVAL_BUTTONS_ENABLED },
+): Promise<string | null> {
+    return replyInteractiveCard(messageId, buildAgentCard(state, options), formatStreamState(state));
+}
+
+async function replyInteractiveCard(messageId: string, card: any, fallbackText: string): Promise<string | null> {
     try {
         const result = await client.im.message.reply({
             path: { message_id: messageId },
             data: {
-                content: JSON.stringify(buildAgentCard(state, { includeApprovalButtons: FEISHU_APPROVAL_BUTTONS_ENABLED })),
+                content: JSON.stringify(card),
                 msg_type: 'interactive',
             },
         });
         return result.data?.message_id || null;
     } catch (e) {
         console.error('发送飞书卡片失败:', e);
-        return replyText(messageId, formatStreamState(state));
+        return replyText(messageId, fallbackText);
     }
 }
 
-async function patchInteractive(messageId: string, state: ReturnType<typeof createStreamState>) {
+async function patchInteractive(
+    messageId: string,
+    state: ReturnType<typeof createStreamState>,
+    options: RuntimeCardOptions = { includeApprovalButtons: FEISHU_APPROVAL_BUTTONS_ENABLED },
+) {
     await client.im.message.patch({
         path: { message_id: messageId },
         data: {
-            content: JSON.stringify(buildAgentCard(state, { includeApprovalButtons: FEISHU_APPROVAL_BUTTONS_ENABLED })),
+            content: JSON.stringify(buildAgentCard(state, options)),
         },
     });
 }
 
-async function updateInteractiveOrText(sourceMessageId: string, targetMessageId: string | null, state: ReturnType<typeof createStreamState>) {
+async function updateInteractiveOrText(
+    sourceMessageId: string,
+    targetMessageId: string | null,
+    state: ReturnType<typeof createStreamState>,
+    options: RuntimeCardOptions = { includeApprovalButtons: FEISHU_APPROVAL_BUTTONS_ENABLED },
+) {
     if (!targetMessageId) {
-        await replyInteractive(sourceMessageId, state);
+        await replyInteractive(sourceMessageId, state, options);
         return;
     }
     try {
-        await patchInteractive(targetMessageId, state);
+        await patchInteractive(targetMessageId, state, options);
     } catch (e) {
         console.error('更新飞书卡片失败:', e);
         await replyText(sourceMessageId, formatStreamState(state));

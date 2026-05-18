@@ -19,10 +19,13 @@ Markdown 输出优化、slash 命令和通用安装文档。
 - 飞书长连接接收消息，不要求公网回调地址。
 - Codex SDK 线程持久化，同一个飞书会话可以延续上下文。
 - 飞书交互卡片展示任务、回复和执行过程。
+- 同一飞书会话支持当前任务、等待队列、取消排队和打断插队。
 - 高风险任务使用飞书卡片按钮审批。
 - 普通问答和只读任务默认直接执行。
 - slash 命令支持 `/help`、`/skills`、`/skill`、`/mcp`、
-  `/approval`、`/reset` 和 `/status`。
+  `/approval`、`/queue`、`/interrupt`、`/cancel`、`/clear-queue`、
+  `/reset` 和 `/status`。
+- 回复区使用飞书 Card JSON 2.0，支持代码块、行内代码标签和原生表格组件。
 - 本地 Web 状态接口展示运行状态和日志。
 
 ## 系统要求
@@ -226,11 +229,29 @@ macOS 可以用 LaunchAgent 管理进程，Linux 可以用 systemd 管理进程�
 - `/skill <name> <task>`：用指定 skill 改写任务并交给 Codex。
 - `/mcp`：查看当前 Codex CLI 可见 MCP。
 - `/approval`：查看审批策略。
+- `/queue`：查看当前任务和等待队列。
+- `/interrupt <task>`：打断当前任务，并把新任务放到队首执行。
+- `/cancel <task_id>`：取消一个等待任务。
+- `/clear-queue`：清空当前会话中属于当前用户的等待任务。
 - `/reset`：清空当前飞书会话绑定的 Codex thread。
 - `/status`：查看机器人状态。
 
 普通问答和只读查询默认直接执行。命中写文件、删除、重启、部署、安装、提交、
 推送、配置修改、外部系统或 MCP 等关键词的任务，会先发送飞书审批卡片。
+
+同一飞书会话中只能有一个 Codex turn 正在运行。当前任务运行期间继续发送普通
+消息时，机器人会发送入队卡片。入队卡片提供 **打断并执行** 和 **取消排队**
+按钮；运行卡片提供 **打断** 和 **查看队列** 按钮。被打断的任务不会自动恢复，
+如果仍需继续，需要重新发送任务。
+
+## 回复格式
+
+机器人使用飞书 Card JSON 2.0 渲染 Codex 回复。代码块保留 Markdown fenced
+code block，行内代码会转换成飞书 `text_tag` 标签，Markdown 表格会转换成飞书
+原生 `table` 组件。
+
+表格组件遵循飞书限制：单张卡片最多渲染 5 个表格，每个表格最多展示 6 列和
+10 行。超出部分会降级为列表文本，避免飞书拒绝创建或更新卡片。
 
 ## 会话与数据文件
 
@@ -258,6 +279,7 @@ npm run build
 - `src/index.ts`：飞书 WebSocket、消息路由、审批和 Codex SDK 编排。
 - `src/streaming.ts`：Codex 事件模型、卡片渲染、Markdown 处理和脱敏。
 - `src/session.ts`：会话文件兼容和更新。
+- `src/queue.ts`：同一飞书会话内的当前任务、等待队列、取消和打断插队。
 - `src/approval.ts`：风险关键词和 Codex 运行策略。
 - `src/slash.ts`：slash 命令解析和本地命令。
 - `src/server.ts`：本地状态接口。

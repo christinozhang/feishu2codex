@@ -29,6 +29,10 @@ export function slashHelpText() {
         '/skill <name> <task> 使用指定 skill 处理任务',
         '/mcp 查看 Codex CLI 可见 MCP',
         '/approval 查看审批策略',
+        '/queue 查看当前会话队列',
+        '/interrupt <task> 打断当前任务并执行新任务',
+        '/cancel <task_id> 取消等待任务',
+        '/clear-queue 清空当前会话等待队列',
         '/reset 清空当前会话记忆',
         '/status 查看机器人状态',
     ].join('\n');

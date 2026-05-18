@@ -54,11 +54,14 @@ graphify update .
 - High-risk messages require Feishu approval before Codex starts.
 - `Approve` runs with the privileged Codex policy.
 - `Deny` or timeout leaves Codex unstarted.
-- `/help`, `/skills`, `/mcp`, `/approval`, `/reset`, and `/status` are handled
-  locally by the bot.
+- `/help`, `/skills`, `/mcp`, `/approval`, `/queue`, `/cancel`,
+  `/clear-queue`, `/reset`, and `/status` are handled locally by the bot.
+- `/interrupt <task>` interrupts the current task and puts the new task at the
+  front of the same user's session queue.
 
 ## Markdown and card behavior
 
-`src/streaming.ts` renders Feishu interactive cards. The response section uses
-Feishu `markdown` elements. Timeline details remain escaped so command output
-does not break the card.
+`src/streaming.ts` renders Feishu Card JSON 2.0 interactive cards. The response
+section uses Feishu `markdown` elements, converts Markdown tables into native
+`table` components, and keeps timeline details escaped so command output does
+not break the card.

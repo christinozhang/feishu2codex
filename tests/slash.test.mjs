@@ -23,6 +23,10 @@ test('help text includes supported commands', () => {
   const help = slashHelpText();
   assert.match(help, /\/skills/);
   assert.match(help, /\/approval/);
+  assert.match(help, /\/queue/);
+  assert.match(help, /\/interrupt <task>/);
+  assert.match(help, /\/cancel <task_id>/);
+  assert.match(help, /\/clear-queue/);
 });
 
 test('lists skills with SKILL.md and filters by keyword', () => {

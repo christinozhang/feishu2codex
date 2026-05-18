@@ -1,6 +1,7 @@
 import type { ThreadEvent, ThreadItem } from '@openai/codex-sdk';
+import type { QueuedTask } from './queue.js';
 
-export type StreamPhase = 'approval' | 'running' | 'completed' | 'failed';
+export type StreamPhase = 'approval' | 'running' | 'completed' | 'failed' | 'interrupted';
 export type TimelineStatus = 'running' | 'completed' | 'failed';
 export type TimelineKind = 'approval' | 'command' | 'mcp' | 'file_change' | 'web_search' | 'todo' | 'error' | 'reasoning';
 
@@ -21,11 +22,24 @@ export type StreamState = {
     approvalId?: string;
 };
 
+export type RuntimeCardOptions = {
+    includeApprovalButtons?: boolean;
+    includeRuntimeButtons?: boolean;
+    sessionKey?: string;
+    taskId?: string;
+    requesterOpenId?: string;
+    sourceMessageId?: string;
+};
+
 const MAX_TASK_CHARS = 300;
 const MAX_TIMELINE_ITEMS = 8;
 const MAX_OUTPUT_SUMMARY_CHARS = 500;
 const MAX_TEXT_CHARS = 3800;
 const MAX_MARKDOWN_ELEMENT_CHARS = 3200;
+const MAX_TABLES_PER_CARD = 5;
+const MAX_TABLE_COLUMNS = 6;
+const MAX_TABLE_ROWS = 10;
+const MAX_TABLE_CELL_CHARS = 180;
 
 const SECRET_PATTERNS = [
     /(Authorization\s*[:=]\s*)(Bearer\s+)?[A-Za-z0-9._~+/=-]+/gi,
@@ -88,6 +102,16 @@ export function updateStreamState(state: StreamState, event: ThreadEvent | any):
     return applyItem(state, event.item);
 }
 
+export function markStreamInterrupted(state: StreamState, detail = '用户已打断当前任务。'): StreamState {
+    return addTimelineItem({ ...state, phase: 'interrupted' }, {
+        id: 'turn.interrupted',
+        kind: 'error',
+        title: '已被打断',
+        detail,
+        status: 'failed',
+    });
+}
+
 export function shouldUpdateCard(previous: StreamState, next: StreamState, lastResponseLength: number): boolean {
     if (previous.phase !== next.phase) return true;
     if (next.responseText.length - lastResponseLength >= 80) return true;
@@ -97,12 +121,12 @@ export function shouldUpdateCard(previous: StreamState, next: StreamState, lastR
     return previousTools !== nextTools;
 }
 
-export function buildAgentCard(state: StreamState, options: { includeApprovalButtons?: boolean } = {}) {
+export function buildAgentCard(state: StreamState, options: RuntimeCardOptions = {}) {
     const header = headerForPhase(state.phase);
     const elements: any[] = [
         {
-            tag: 'div',
-            text: { tag: 'lark_md', content: `**任务**\n${formatCardMarkdown(state.task || '未命名任务', MAX_TASK_CHARS)}` },
+            tag: 'markdown',
+            content: `**任务**\n${formatCardMarkdown(state.task || '未命名任务', MAX_TASK_CHARS)}`,
         },
     ];
 
@@ -122,39 +146,129 @@ export function buildAgentCard(state: StreamState, options: { includeApprovalBut
                 },
             },
             elements: timeline.map((item) => ({
-                tag: 'div',
-                text: {
-                    tag: 'lark_md',
-                    content: formatTimelineItem(item),
-                },
+                tag: 'markdown',
+                content: formatTimelineItem(item),
             })),
         });
     }
 
     if (state.phase === 'approval' && state.approvalId && options.includeApprovalButtons !== false) {
-        elements.push({
-            tag: 'action',
-            actions: [
-                {
-                    tag: 'button',
-                    text: { tag: 'plain_text', content: 'Approve' },
-                    type: 'primary',
-                    value: { action: 'approve', approval_id: state.approvalId },
-                },
-                {
-                    tag: 'button',
-                    text: { tag: 'plain_text', content: 'Deny' },
-                    type: 'danger',
-                    value: { action: 'deny', approval_id: state.approvalId },
-                },
-            ],
-        });
+        elements.push(
+            buildCallbackButton('Approve', 'primary', { action: 'approve', approval_id: state.approvalId }),
+            buildCallbackButton('Deny', 'danger', { action: 'deny', approval_id: state.approvalId }),
+        );
     }
 
+    if (state.phase === 'running' && options.includeRuntimeButtons && options.sessionKey && options.taskId) {
+        elements.push(
+            buildCallbackButton('打断', 'danger', {
+                action: 'interrupt_current',
+                session_key: options.sessionKey,
+                task_id: options.taskId,
+                requester_open_id: options.requesterOpenId,
+                source_message_id: options.sourceMessageId,
+            }),
+            buildCallbackButton('查看队列', 'default', {
+                action: 'show_queue',
+                session_key: options.sessionKey,
+                requester_open_id: options.requesterOpenId,
+                source_message_id: options.sourceMessageId,
+            }),
+        );
+    }
+
+    return buildCard(header, elements);
+}
+
+export function buildQueuedTaskCard(params: {
+    task: QueuedTask;
+    position: number;
+    queueLength: number;
+    currentTask: QueuedTask | null;
+}) {
+    const task = params.task;
+    return buildCard(
+        { template: 'blue', title: { tag: 'plain_text', content: 'Codex 已加入队列' } },
+        [
+            {
+                tag: 'markdown',
+                content: [
+                    `**任务**\n${formatCardMarkdown(task.userText, MAX_TASK_CHARS)}`,
+                    `**任务 ID**\n${escapeMd(task.id)}`,
+                    `**队列位置**\n第 ${params.position} 位 / 共 ${params.queueLength} 位`,
+                    `**当前运行**\n${formatCardMarkdown(params.currentTask?.userText || '无', 120)}`,
+                ].join('\n\n'),
+            },
+            buildCallbackButton('打断并执行', 'danger', {
+                action: 'interrupt_with_task',
+                session_key: task.sessionKey,
+                task_id: task.id,
+                requester_open_id: task.senderOpenId,
+                source_message_id: task.sourceMessageId,
+            }),
+            buildCallbackButton('取消排队', 'default', {
+                action: 'cancel_queued_task',
+                session_key: task.sessionKey,
+                task_id: task.id,
+                requester_open_id: task.senderOpenId,
+                source_message_id: task.sourceMessageId,
+            }),
+        ],
+    );
+}
+
+export function buildQueueSummaryCard(params: {
+    sessionKey: string;
+    currentTask: QueuedTask | null;
+    queue: QueuedTask[];
+}) {
+    const waiting = params.queue.slice(0, 10);
+    const waitingText = waiting.length > 0
+        ? waiting.map((task, index) => `${index + 1}. ${escapeMd(task.id)} · ${formatCardMarkdown(task.userText, 100)}`).join('\n')
+        : '无等待任务';
+
+    return buildCard(
+        { template: 'blue', title: { tag: 'plain_text', content: 'Codex 队列' } },
+        [
+            {
+                tag: 'markdown',
+                content: [
+                    `**当前运行**\n${formatCardMarkdown(params.currentTask?.userText || '无', 140)}`,
+                    `**等待队列**\n${waitingText}`,
+                    params.queue.length > waiting.length ? `还有 ${params.queue.length - waiting.length} 条未展示。` : '',
+                ].filter(Boolean).join('\n\n'),
+            },
+        ],
+    );
+}
+
+function buildCard(header: any, elements: any[]) {
     return {
+        schema: '2.0',
         config: { wide_screen_mode: true, update_multi: true },
         header,
-        elements,
+        body: {
+            direction: 'vertical',
+            padding: '12px',
+            vertical_spacing: '8px',
+            elements,
+        },
+    };
+}
+
+function buildCallbackButton(content: string, type: 'default' | 'primary' | 'danger', value: Record<string, unknown>) {
+    return {
+        tag: 'button',
+        text: { tag: 'plain_text', content },
+        type,
+        size: 'medium',
+        width: 'fill',
+        behaviors: [
+            {
+                type: 'callback',
+                value,
+            },
+        ],
     };
 }
 
@@ -273,6 +387,9 @@ function headerForPhase(phase: StreamPhase) {
     if (phase === 'approval') {
         return { template: 'yellow', title: { tag: 'plain_text', content: 'Codex 等待审批' } };
     }
+    if (phase === 'interrupted') {
+        return { template: 'grey', title: { tag: 'plain_text', content: 'Codex 已被打断' } };
+    }
     return { template: 'blue', title: { tag: 'plain_text', content: 'Codex 正在处理' } };
 }
 
@@ -327,17 +444,160 @@ function formatCardMarkdown(text: unknown, limit: number) {
 }
 
 function buildMarkdownSection(title: string, text: unknown, limit: number) {
-    const content = normalizeMarkdownForCardView(safeText(text, limit));
-    return [
+    const parsed = parseMarkdownSegments(safeText(text, limit));
+    const elements: any[] = [
         {
             tag: 'markdown',
             content: `**${title}**`,
         },
-        ...splitMarkdownContent(content).map((chunk) => ({
-            tag: 'markdown',
-            content: chunk,
-        })),
     ];
+    let renderedTables = 0;
+    for (const segment of parsed) {
+        if (segment.type === 'table' && renderedTables < MAX_TABLES_PER_CARD) {
+            elements.push(buildTableElement(segment.headers, segment.rows));
+            renderedTables++;
+            continue;
+        }
+        const content = segment.type === 'table'
+            ? normalizeMarkdownForCardView(formatTableAsList(segment.headers, segment.rows))
+            : normalizeMarkdownForCardView(segment.content);
+        for (const chunk of splitMarkdownContent(content)) {
+            elements.push({ tag: 'markdown', content: chunk });
+        }
+    }
+    return elements;
+}
+
+type MarkdownSegment =
+    | { type: 'markdown'; content: string }
+    | { type: 'table'; headers: string[]; rows: string[][] };
+
+function parseMarkdownSegments(text: string): MarkdownSegment[] {
+    const lines = text.split('\n');
+    const segments: MarkdownSegment[] = [];
+    let buffer: string[] = [];
+    let index = 0;
+
+    const flushBuffer = () => {
+        const content = buffer.join('\n').trim();
+        if (content) segments.push({ type: 'markdown', content });
+        buffer = [];
+    };
+
+    while (index < lines.length) {
+        const line = lines[index] || '';
+        if (isFenceStart(line)) {
+            const fence: string[] = [line];
+            index++;
+            while (index < lines.length) {
+                fence.push(lines[index] || '');
+                if (isFenceStart(lines[index] || '')) {
+                    index++;
+                    break;
+                }
+                index++;
+            }
+            buffer.push(fence.join('\n'));
+            continue;
+        }
+
+        if (index + 1 < lines.length && isTableRow(line) && isTableSeparator(lines[index + 1] || '')) {
+            flushBuffer();
+            const headers = splitTableRow(line);
+            index += 2;
+            const rows: string[][] = [];
+            while (index < lines.length && isTableRow(lines[index] || '')) {
+                rows.push(splitTableRow(lines[index] || ''));
+                index++;
+            }
+            if (headers.length >= 2 && rows.length > 0) {
+                segments.push({ type: 'table', headers, rows });
+            } else {
+                buffer.push([line, lines[index - 1] || ''].join('\n'));
+            }
+            continue;
+        }
+
+        buffer.push(line);
+        index++;
+    }
+    flushBuffer();
+    return segments;
+}
+
+function buildTableElement(headers: string[], rows: string[][]) {
+    const visibleHeaders = headers.slice(0, MAX_TABLE_COLUMNS).map((header, index) => sanitizeTableCell(header) || `列 ${index + 1}`);
+    return {
+        tag: 'table',
+        page_size: Math.min(Math.max(rows.length, 1), 5),
+        row_height: 'auto',
+        row_max_height: '120px',
+        freeze_first_column: visibleHeaders.length > 2,
+        header_style: {
+            text_align: 'left',
+            text_size: 'normal',
+            background_style: 'none',
+            text_color: 'default',
+            bold: true,
+            lines: 2,
+        },
+        columns: visibleHeaders.map((header, index) => ({
+            name: `col_${index}`,
+            display_name: header,
+            data_type: 'lark_md',
+            width: 'auto',
+            vertical_align: 'top',
+            horizontal_align: 'left',
+        })),
+        rows: rows.slice(0, MAX_TABLE_ROWS).map((row) => {
+            const entry: Record<string, string> = {};
+            for (let index = 0; index < visibleHeaders.length; index++) {
+                entry[`col_${index}`] = sanitizeTableCell(row[index] || '');
+            }
+            return entry;
+        }),
+    };
+}
+
+function formatTableAsList(headers: string[], rows: string[][]) {
+    return rows.map((row) => {
+        const fields = headers.map((header, index) => {
+            const value = row[index] || '';
+            return `${stripMarkdownMarkers(header)}: ${stripMarkdownMarkers(value)}`;
+        });
+        return `- ${fields.join('；')}`;
+    }).join('\n');
+}
+
+function sanitizeTableCell(value: string) {
+    return safeText(normalizeMarkdownForCardView(stripMarkdownMarkers(value)).replace(/\n+/g, ' '), MAX_TABLE_CELL_CHARS);
+}
+
+function stripMarkdownMarkers(value: string) {
+    return value
+        .trim()
+        .replace(/^:+|:+$/g, '')
+        .replace(/\*\*([^*]+)\*\*/g, '$1')
+        .replace(/__([^_]+)__/g, '$1');
+}
+
+function isFenceStart(line: string) {
+    return /^\s*```/.test(line);
+}
+
+function isTableRow(line: string) {
+    const trimmed = line.trim();
+    return trimmed.includes('|') && splitTableRow(trimmed).length >= 2;
+}
+
+function isTableSeparator(line: string) {
+    const cells = splitTableRow(line);
+    return cells.length >= 2 && cells.every((cell) => /^:?-{3,}:?$/.test(cell.trim()));
+}
+
+function splitTableRow(line: string) {
+    const trimmed = line.trim().replace(/^\|/, '').replace(/\|$/, '');
+    return trimmed.split('|').map((cell) => cell.trim());
 }
 
 function normalizeMarkdownForCardView(text: string) {
@@ -359,7 +619,7 @@ function renderInlineCodeTags(text: string) {
 
 function renderInlineCodeInText(text: string) {
     return text.replace(/`([^`\n]{1,120})`/g, (_match, code) => {
-        return `<text_tag color='grey'>${escapeTextTagContent(String(code))}</text_tag>`;
+        return `<text_tag color='neutral'>${escapeTextTagContent(String(code))}</text_tag>`;
     });
 }
 
@@ -388,7 +648,6 @@ function splitMarkdownContent(text: string) {
 
 function normalizeMarkdownForLark(text: string) {
     let normalized = text
-        .replace(/```[ \t]*[A-Za-z0-9_+.#-]+[ \t]*\n/g, '```\n')
         .replace(/\n{3,}/g, '\n\n');
 
     const fenceCount = (normalized.match(/```/g) || []).length;
