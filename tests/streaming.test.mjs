@@ -16,6 +16,13 @@ function cardElements(card) {
   return card.body?.elements || card.elements || [];
 }
 
+function markdownText(card) {
+  return cardElements(card)
+    .filter((item) => item.tag === 'markdown')
+    .map((item) => item.content)
+    .join('\n');
+}
+
 test('formats agent response and command timeline from Codex events', () => {
   let state = createStreamState('看下状态');
 
@@ -96,8 +103,12 @@ test('reports failed turns as readable text', () => {
   assert.match(formatStreamState(state), /Codex Exec exited with code 1/);
 });
 
-test('card renders response above collapsible process and supports approval buttons', () => {
+test('card renders content stream in event order and supports approval buttons', () => {
   let state = createApprovalState('重启 bot', 'approval-1', 'Sandbox: danger-full-access');
+  state = updateStreamState(state, {
+    type: 'item.completed',
+    item: { id: 'msg-before', type: 'agent_message', text: '准备重启。' },
+  });
   state = updateStreamState(state, {
     type: 'item.completed',
     item: {
@@ -111,26 +122,95 @@ test('card renders response above collapsible process and supports approval butt
   });
   state = updateStreamState(state, {
     type: 'item.completed',
-    item: { id: 'msg', type: 'agent_message', text: '完成' },
+    item: { id: 'msg-after', type: 'agent_message', text: '完成' },
   });
 
   const card = buildAgentCard(state);
   const elements = cardElements(card);
-  const responseTitleIndex = elements.findIndex((item) => item.tag === 'markdown' && item.content === '**回复**');
-  const panelIndex = elements.findIndex((item) => item.tag === 'collapsible_panel');
+  const beforeIndex = elements.findIndex((item) => item.tag === 'markdown' && item.content.includes('准备重启。'));
+  const panelIndex = elements.findIndex((item) => item.tag === 'collapsible_panel' && item.header.title.content.includes('命令'));
+  const afterIndex = elements.findIndex((item) => item.tag === 'markdown' && item.content.includes('完成'));
   const approvalIndex = elements.findIndex((item) => item.tag === 'button' && item.behaviors?.[0]?.value?.action === 'approve');
   assert.equal(card.header.template, 'yellow');
   assert.equal(card.schema, '2.0');
-  assert.equal(elements[responseTitleIndex + 1].tag, 'markdown');
-  assert.equal(elements[responseTitleIndex + 1].content, '完成');
-  assert.ok(responseTitleIndex > -1 && responseTitleIndex < panelIndex);
-  assert.ok(panelIndex > -1 && panelIndex < approvalIndex);
+  assert.equal(panelIndex > -1 && afterIndex > -1, true);
+  assert.equal(elements[panelIndex].header.title.content, '已运行 1 条命令');
+  assert.equal(elements[panelIndex].expanded, false);
+  assert.ok(beforeIndex > -1 && beforeIndex < panelIndex);
+  assert.ok(panelIndex < afterIndex && afterIndex < approvalIndex);
+  assert.doesNotMatch(markdownText(card), /\*\*回复\*\*|执行过程/);
   assert.equal(elements[approvalIndex].behaviors[0].value.approval_id, 'approval-1');
   assert.doesNotThrow(() => JSON.stringify(card));
 });
 
-test('completed card collapses execution process and command output is truncated', () => {
+test('continuous commands are grouped and collapsed when completed', () => {
+  let state = createStreamState('连续命令');
+  for (const [id, command] of [['cmd-1', 'pwd'], ['cmd-2', 'git status'], ['cmd-3', 'ls']]) {
+    state = updateStreamState(state, {
+      type: 'item.completed',
+      item: {
+        id,
+        type: 'command_execution',
+        command,
+        status: 'completed',
+        exit_code: 0,
+        aggregated_output: 'ok',
+      },
+    });
+  }
+
+  const card = buildAgentCard(state);
+  const panels = cardElements(card).filter((item) => item.tag === 'collapsible_panel');
+  assert.equal(panels.length, 1);
+  assert.equal(panels[0].header.title.content, '已运行 3 条命令');
+  assert.equal(panels[0].expanded, false);
+  assert.match(JSON.stringify(panels[0]), /pwd/);
+  assert.match(JSON.stringify(panels[0]), /git status/);
+  assert.match(JSON.stringify(panels[0]), /ls/);
+});
+
+test('assistant text between commands starts a new command group', () => {
+  let state = createStreamState('分组');
+  state = updateStreamState(state, {
+    type: 'item.completed',
+    item: { id: 'cmd-1', type: 'command_execution', command: 'pwd', status: 'completed' },
+  });
+  state = updateStreamState(state, {
+    type: 'item.completed',
+    item: { id: 'msg', type: 'agent_message', text: '中间说明' },
+  });
+  state = updateStreamState(state, {
+    type: 'item.completed',
+    item: { id: 'cmd-2', type: 'command_execution', command: 'git status', status: 'completed' },
+  });
+
+  const elements = cardElements(buildAgentCard(state));
+  const panels = elements.filter((item) => item.tag === 'collapsible_panel');
+  const middleIndex = elements.findIndex((item) => item.tag === 'markdown' && item.content.includes('中间说明'));
+  assert.equal(panels.length, 2);
+  assert.equal(panels[0].header.title.content, '已运行 1 条命令');
+  assert.equal(panels[1].header.title.content, '已运行 1 条命令');
+  assert.ok(elements.indexOf(panels[0]) < middleIndex);
+  assert.ok(middleIndex < elements.indexOf(panels[1]));
+});
+
+test('running command group is expanded and completed group is folded', () => {
   let state = createStreamState('长输出');
+  state = updateStreamState(state, {
+    type: 'item.started',
+    item: {
+      id: 'cmd',
+      type: 'command_execution',
+      command: 'cat big.log',
+      status: 'in_progress',
+      aggregated_output: '',
+    },
+  });
+
+  let panel = cardElements(buildAgentCard(state)).find((item) => item.tag === 'collapsible_panel');
+  assert.equal(panel.header.title.content, '正在运行 1 条命令');
+  assert.equal(panel.expanded, true);
+
   state = updateStreamState(state, {
     type: 'item.completed',
     item: {
@@ -145,10 +225,32 @@ test('completed card collapses execution process and command output is truncated
   state = updateStreamState(state, { type: 'turn.completed' });
 
   const card = buildAgentCard(state);
-  const panel = cardElements(card).find((item) => item.tag === 'collapsible_panel');
+  panel = cardElements(card).find((item) => item.tag === 'collapsible_panel');
   assert.equal(card.header.template, 'green');
+  assert.equal(panel.header.title.content, '已运行 1 条命令');
   assert.equal(panel.expanded, false);
   assert.match(JSON.stringify(card), /truncated/);
+});
+
+test('failed commands render failed command group', () => {
+  let state = createStreamState('长输出');
+  state = updateStreamState(state, {
+    type: 'item.completed',
+    item: {
+      id: 'cmd',
+      type: 'command_execution',
+      command: 'cat big.log',
+      status: 'failed',
+      exit_code: 1,
+      aggregated_output: 'permission denied',
+    },
+  });
+
+  const card = buildAgentCard(state);
+  const panel = cardElements(card).find((item) => item.tag === 'collapsible_panel');
+  assert.equal(panel.header.title.content, '命令失败 · 1 条命令');
+  assert.equal(panel.expanded, false);
+  assert.match(JSON.stringify(panel), /exit_code=1/);
 });
 
 test('running card supports interrupt and queue buttons', () => {
@@ -176,6 +278,7 @@ test('interrupted card has dedicated phase and title', () => {
   assert.equal(state.phase, 'interrupted');
   assert.equal(card.header.title.content, 'Codex 已被打断');
   assert.match(formatStreamState(state), /已被打断/);
+  assert.match(markdownText(card), /用户已打断当前任务/);
 });
 
 test('queue cards render waiting task controls and summary', () => {
@@ -215,10 +318,8 @@ test('card response renders inline code as Feishu neutral text tags and keeps fe
   });
 
   const card = buildAgentCard(state);
-  const elements = cardElements(card);
-  const responseTitleIndex = elements.findIndex((item) => item.tag === 'markdown' && item.content === '**回复**');
-  const responseContent = elements.slice(responseTitleIndex + 1).filter((item) => item.tag === 'markdown').map((item) => item.content).join('\n');
-  assert.ok(responseTitleIndex > -1);
+  const responseContent = markdownText(card);
+  assert.doesNotMatch(responseContent, /\*\*回复\*\*/);
   assert.match(responseContent, /Jenkins <text_tag color='neutral'>eks-autotest<\/text_tag> 当前命令/);
   assert.match(responseContent, /```text\ncodex exec --experimental-json/);
   assert.match(responseContent, /<text_tag color='neutral'>inline<\/text_tag>/);

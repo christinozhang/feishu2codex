@@ -14,11 +14,54 @@ export type TimelineItem = {
     status: TimelineStatus;
 };
 
+export type DisplayBlockStatus = 'running' | 'completed' | 'failed';
+
+type BlockBase = {
+    id: string;
+    status: DisplayBlockStatus;
+    createdAt: number;
+    updatedAt: number;
+    collapsed: boolean;
+};
+
+export type AssistantBlock = BlockBase & {
+    type: 'assistant';
+    content: string;
+};
+
+export type CommandBlockItem = {
+    id: string;
+    command: string;
+    detail: string;
+    status: TimelineStatus;
+    exitCode?: string | number;
+};
+
+export type CommandGroupBlock = BlockBase & {
+    type: 'command_group';
+    commands: CommandBlockItem[];
+};
+
+export type ToolGroupBlock = BlockBase & {
+    type: 'tool_group';
+    title: string;
+    items: TimelineItem[];
+};
+
+export type ErrorBlock = BlockBase & {
+    type: 'error';
+    title: string;
+    detail: string;
+};
+
+export type DisplayBlock = AssistantBlock | CommandGroupBlock | ToolGroupBlock | ErrorBlock;
+
 export type StreamState = {
     phase: StreamPhase;
     task: string;
     responseText: string;
     timeline: TimelineItem[];
+    blocks: DisplayBlock[];
     approvalId?: string;
 };
 
@@ -33,6 +76,7 @@ export type RuntimeCardOptions = {
 
 const MAX_TASK_CHARS = 300;
 const MAX_TIMELINE_ITEMS = 8;
+const MAX_VISIBLE_BLOCKS = 12;
 const MAX_OUTPUT_SUMMARY_CHARS = 500;
 const MAX_TEXT_CHARS = 3800;
 const MAX_MARKDOWN_ELEMENT_CHARS = 3200;
@@ -54,11 +98,12 @@ export function createStreamState(task = '', phase: StreamPhase = 'running'): St
         task: safeText(task, MAX_TASK_CHARS),
         responseText: '',
         timeline: [],
+        blocks: [],
     };
 }
 
 export function createApprovalState(task: string, approvalId: string, detail: string): StreamState {
-    return addTimelineItem({
+    const state = addTimelineItem({
         ...createStreamState(task, 'approval'),
         approvalId,
     }, {
@@ -68,6 +113,7 @@ export function createApprovalState(task: string, approvalId: string, detail: st
         detail,
         status: 'running',
     });
+    return addToolBlock(state, state.timeline[state.timeline.length - 1]);
 }
 
 export function updateStreamState(state: StreamState, event: ThreadEvent | any): StreamState {
@@ -76,23 +122,23 @@ export function updateStreamState(state: StreamState, event: ThreadEvent | any):
     }
 
     if (event.type === 'turn.failed') {
-        return addTimelineItem({ ...state, phase: 'failed' }, {
+        return upsertErrorBlock(addTimelineItem({ ...state, phase: 'failed' }, {
             id: 'turn.failed',
             kind: 'error',
             title: '处理失败',
             detail: event.error?.message || 'Codex turn failed',
             status: 'failed',
-        });
+        }), 'turn.failed', '处理失败', event.error?.message || 'Codex turn failed');
     }
 
     if (event.type === 'error') {
-        return addTimelineItem({ ...state, phase: 'failed' }, {
+        return upsertErrorBlock(addTimelineItem({ ...state, phase: 'failed' }, {
             id: 'error',
             kind: 'error',
             title: '处理失败',
             detail: event.message || String(event),
             status: 'failed',
-        });
+        }), 'error', '处理失败', event.message || String(event));
     }
 
     if (event.type !== 'item.started' && event.type !== 'item.updated' && event.type !== 'item.completed') {
@@ -103,13 +149,14 @@ export function updateStreamState(state: StreamState, event: ThreadEvent | any):
 }
 
 export function markStreamInterrupted(state: StreamState, detail = '用户已打断当前任务。'): StreamState {
-    return addTimelineItem({ ...state, phase: 'interrupted' }, {
+    const next = addTimelineItem({ ...state, phase: 'interrupted' }, {
         id: 'turn.interrupted',
         kind: 'error',
         title: '已被打断',
         detail,
         status: 'failed',
     });
+    return upsertErrorBlock(next, 'turn.interrupted', '已被打断', detail);
 }
 
 export function shouldUpdateCard(previous: StreamState, next: StreamState, lastResponseLength: number): boolean {
@@ -118,7 +165,20 @@ export function shouldUpdateCard(previous: StreamState, next: StreamState, lastR
 
     const previousTools = previous.timeline.map((item) => `${item.id}:${item.status}:${item.detail}`).join('|');
     const nextTools = next.timeline.map((item) => `${item.id}:${item.status}:${item.detail}`).join('|');
-    return previousTools !== nextTools;
+    if (previousTools !== nextTools) return true;
+
+    return summarizeBlocksForDiff(previous.blocks) !== summarizeBlocksForDiff(next.blocks);
+}
+
+export function hasCommandGroupCompletionChange(previous: StreamState, next: StreamState): boolean {
+    const previousStatuses = new Map(
+        previous.blocks
+            .filter((block): block is CommandGroupBlock => block.type === 'command_group')
+            .map((block) => [block.id, block.status]),
+    );
+    return next.blocks
+        .filter((block): block is CommandGroupBlock => block.type === 'command_group')
+        .some((block) => previousStatuses.get(block.id) === 'running' && block.status !== 'running');
 }
 
 export function buildAgentCard(state: StreamState, options: RuntimeCardOptions = {}) {
@@ -130,27 +190,7 @@ export function buildAgentCard(state: StreamState, options: RuntimeCardOptions =
         },
     ];
 
-    if (state.responseText.trim()) {
-        elements.push(...buildMarkdownSection('回复', state.responseText, 8000));
-    }
-
-    const timeline = state.timeline.slice(-MAX_TIMELINE_ITEMS);
-    if (timeline.length > 0) {
-        elements.push({
-            tag: 'collapsible_panel',
-            expanded: state.phase !== 'completed',
-            header: {
-                title: {
-                    tag: 'plain_text',
-                    content: `执行过程 · ${state.timeline.length} 条`,
-                },
-            },
-            elements: timeline.map((item) => ({
-                tag: 'markdown',
-                content: formatTimelineItem(item),
-            })),
-        });
-    }
+    elements.push(...buildBlockElements(state.blocks));
 
     if (state.phase === 'approval' && state.approvalId && options.includeApprovalButtons !== false) {
         elements.push(
@@ -272,6 +312,127 @@ function buildCallbackButton(content: string, type: 'default' | 'primary' | 'dan
     };
 }
 
+function buildBlockElements(blocks: DisplayBlock[]) {
+    if (blocks.length === 0) return [];
+    const visibleBlocks = blocks.slice(-MAX_VISIBLE_BLOCKS);
+    const hiddenCount = blocks.length - visibleBlocks.length;
+    const elements: any[] = [];
+    if (hiddenCount > 0) {
+        elements.push({
+            tag: 'markdown',
+            content: `较早内容已压缩 · ${hiddenCount} 条`,
+        });
+    }
+    for (const block of visibleBlocks) {
+        elements.push(...renderBlock(block));
+    }
+    return elements;
+}
+
+function renderBlock(block: DisplayBlock): any[] {
+    if (block.type === 'assistant') {
+        return buildMarkdownSection(null, block.content, 8000);
+    }
+    if (block.type === 'command_group') {
+        return [buildCommandGroupPanel(block)];
+    }
+    if (block.type === 'tool_group') {
+        return [buildToolGroupPanel(block)];
+    }
+    return buildMarkdownSection(null, `**${block.title}**\n${block.detail}`, 1600);
+}
+
+function buildCommandGroupPanel(block: CommandGroupBlock) {
+    return {
+        tag: 'collapsible_panel',
+        expanded: !block.collapsed,
+        header: {
+            title: {
+                tag: 'plain_text',
+                content: commandGroupTitle(block),
+            },
+        },
+        elements: buildCommandGroupElements(block),
+    };
+}
+
+function buildCommandGroupElements(block: CommandGroupBlock) {
+    const commands = block.commands.slice(-MAX_TIMELINE_ITEMS);
+    if (block.collapsed) {
+        return commands.map((item) => ({
+            tag: 'markdown',
+            content: formatCollapsedCommand(item),
+        }));
+    }
+    return commands.map((item) => ({
+        tag: 'markdown',
+        content: formatExpandedCommand(item),
+    }));
+}
+
+function buildToolGroupPanel(block: ToolGroupBlock) {
+    return {
+        tag: 'collapsible_panel',
+        expanded: !block.collapsed,
+        header: {
+            title: {
+                tag: 'plain_text',
+                content: block.title,
+            },
+        },
+        elements: block.items.slice(-MAX_TIMELINE_ITEMS).map((item) => ({
+            tag: 'markdown',
+            content: formatTimelineItem(item),
+        })),
+    };
+}
+
+function commandGroupTitle(block: CommandGroupBlock) {
+    const count = block.commands.length;
+    if (block.status === 'failed') return `命令失败 · ${count} 条命令`;
+    if (block.status === 'completed') return `已运行 ${count} 条命令`;
+    return `正在运行 ${count} 条命令`;
+}
+
+function formatCollapsedCommand(item: CommandBlockItem) {
+    const exitCode = item.exitCode !== undefined ? ` · exit_code=${item.exitCode}` : '';
+    const summary = item.detail ? `\n${formatCardMarkdown(item.detail, MAX_OUTPUT_SUMMARY_CHARS + 120)}` : '';
+    return `已运行 ${formatCardMarkdown(item.command || 'unknown command', 300)}${exitCode}${summary}`;
+}
+
+function formatExpandedCommand(item: CommandBlockItem) {
+    const statusText = item.status === 'running' ? '运行中' : item.status === 'failed' ? '失败' : '已完成';
+    return [
+        `**${statusText}** ${formatCardMarkdown(item.command || 'unknown command', 300)}`,
+        item.detail ? formatCardMarkdown(item.detail, MAX_OUTPUT_SUMMARY_CHARS + 120) : '',
+    ].filter(Boolean).join('\n');
+}
+
+function toolGroupTitle(items: TimelineItem[]) {
+    if (items.length === 0) return '工具事件';
+    const status = toolGroupStatus(items);
+    const prefix = status === 'running' ? '正在执行' : status === 'failed' ? '工具失败' : '已执行';
+    if (items.length === 1) return `${prefix} ${items[0].title}`;
+    return `${prefix} ${items.length} 个工具事件`;
+}
+
+function summarizeBlocksForDiff(blocks: DisplayBlock[]) {
+    return blocks.map((block) => {
+        if (block.type === 'assistant') {
+            return `${block.id}:assistant:${block.status}:${block.content.length}:${block.content.slice(-80)}`;
+        }
+        if (block.type === 'command_group') {
+            const commands = block.commands.map((item) => `${item.id}:${item.status}:${item.exitCode ?? ''}:${item.detail}`).join(',');
+            return `${block.id}:command_group:${block.status}:${block.collapsed}:${commands}`;
+        }
+        if (block.type === 'tool_group') {
+            const items = block.items.map((item) => `${item.id}:${item.status}:${item.detail}`).join(',');
+            return `${block.id}:tool_group:${block.status}:${block.collapsed}:${items}`;
+        }
+        return `${block.id}:error:${block.detail}`;
+    }).join('|');
+}
+
 export function formatStreamState(state: StreamState): string {
     const title = headerForPhase(state.phase).title.content;
     const parts = [title, `任务:\n${safeText(state.task || '未命名任务', MAX_TEXT_CHARS)}`];
@@ -299,9 +460,9 @@ export function redact(value: unknown): string {
 function applyItem(state: StreamState, item: ThreadItem | any): StreamState {
     switch (item.type) {
         case 'agent_message':
-            return { ...state, responseText: redact(item.text || '') };
+            return upsertAssistantBlock({ ...state, responseText: redact(item.text || '') }, item);
         case 'reasoning':
-            return addTimelineItem(state, {
+            return addTimelineAndToolBlock(state, {
                 id: item.id,
                 kind: 'reasoning',
                 title: '分析中',
@@ -309,15 +470,15 @@ function applyItem(state: StreamState, item: ThreadItem | any): StreamState {
                 status: statusFromItem(item.status),
             });
         case 'command_execution':
-            return addTimelineItem(state, {
+            return upsertCommandBlock(addTimelineItem(state, {
                 id: item.id,
                 kind: 'command',
                 title: commandTitle(item.status),
                 detail: formatCommandDetail(item),
                 status: statusFromItem(item.status),
-            });
+            }), item);
         case 'mcp_tool_call':
-            return addTimelineItem(state, {
+            return addTimelineAndToolBlock(state, {
                 id: item.id,
                 kind: 'mcp',
                 title: `MCP ${item.server || 'unknown'}.${item.tool || 'unknown'}`,
@@ -325,7 +486,7 @@ function applyItem(state: StreamState, item: ThreadItem | any): StreamState {
                 status: statusFromItem(item.status),
             });
         case 'file_change':
-            return addTimelineItem(state, {
+            return addTimelineAndToolBlock(state, {
                 id: item.id,
                 kind: 'file_change',
                 title: `文件变更 ${item.status || ''}`.trim(),
@@ -333,7 +494,7 @@ function applyItem(state: StreamState, item: ThreadItem | any): StreamState {
                 status: statusFromItem(item.status),
             });
         case 'web_search':
-            return addTimelineItem(state, {
+            return addTimelineAndToolBlock(state, {
                 id: item.id,
                 kind: 'web_search',
                 title: 'Web 搜索',
@@ -341,7 +502,7 @@ function applyItem(state: StreamState, item: ThreadItem | any): StreamState {
                 status: statusFromItem(item.status || 'completed'),
             });
         case 'todo_list':
-            return addTimelineItem(state, {
+            return addTimelineAndToolBlock(state, {
                 id: item.id,
                 kind: 'todo',
                 title: '任务列表',
@@ -349,13 +510,13 @@ function applyItem(state: StreamState, item: ThreadItem | any): StreamState {
                 status: statusFromItem(item.status || 'completed'),
             });
         case 'error':
-            return addTimelineItem({ ...state, phase: 'failed' }, {
+            return upsertErrorBlock(addTimelineItem({ ...state, phase: 'failed' }, {
                 id: item.id,
                 kind: 'error',
                 title: '处理失败',
                 detail: item.message || 'unknown error',
                 status: 'failed',
-            });
+            }), item.id || 'error', '处理失败', item.message || 'unknown error');
         default:
             return state;
     }
@@ -375,6 +536,181 @@ function addTimelineItem(state: StreamState, item: Omit<TimelineItem, 'timestamp
         ...state,
         timeline: state.timeline.map((entry) => entry.id === nextItem.id ? { ...entry, ...nextItem } : entry),
     };
+}
+
+function addTimelineAndToolBlock(state: StreamState, item: Omit<TimelineItem, 'timestamp'> & { timestamp?: string }) {
+    const next = addTimelineItem(state, item);
+    const timelineItem = next.timeline.find((entry) => entry.id === item.id);
+    return timelineItem ? addToolBlock(next, timelineItem) : next;
+}
+
+function upsertAssistantBlock(state: StreamState, item: any): StreamState {
+    const id = item.id || `assistant-${state.blocks.length + 1}`;
+    const content = redact(item.text || '');
+    const now = Date.now();
+    const index = state.blocks.findIndex((block) => block.type === 'assistant' && block.id === id);
+    const nextBlock: AssistantBlock = {
+        type: 'assistant',
+        id,
+        content,
+        status: 'completed',
+        collapsed: false,
+        createdAt: index >= 0 ? state.blocks[index].createdAt : now,
+        updatedAt: now,
+    };
+    if (index >= 0) {
+        return {
+            ...state,
+            blocks: state.blocks.map((block, blockIndex) => blockIndex === index ? nextBlock : block),
+        };
+    }
+    return { ...state, blocks: [...state.blocks, nextBlock] };
+}
+
+function upsertCommandBlock(state: StreamState, item: any): StreamState {
+    const commandItem = commandBlockItemFromThreadItem(item);
+    const existingGroupIndex = state.blocks.findIndex((block) => {
+        return block.type === 'command_group' && block.commands.some((command) => command.id === commandItem.id);
+    });
+    if (existingGroupIndex >= 0) {
+        const block = state.blocks[existingGroupIndex] as CommandGroupBlock;
+        const commands = block.commands.map((command) => command.id === commandItem.id ? commandItem : command);
+        const nextBlock = normalizeCommandGroup({ ...block, commands, updatedAt: Date.now() });
+        return {
+            ...state,
+            blocks: state.blocks.map((entry, index) => index === existingGroupIndex ? nextBlock : entry),
+        };
+    }
+
+    const lastBlock = state.blocks[state.blocks.length - 1];
+    if (lastBlock?.type === 'command_group') {
+        const nextBlock = normalizeCommandGroup({
+            ...lastBlock,
+            commands: [...lastBlock.commands, commandItem],
+            updatedAt: Date.now(),
+        });
+        return {
+            ...state,
+            blocks: state.blocks.map((entry, index) => index === state.blocks.length - 1 ? nextBlock : entry),
+        };
+    }
+
+    const now = Date.now();
+    const nextBlock = normalizeCommandGroup({
+        type: 'command_group',
+        id: `command-group-${commandItem.id}`,
+        commands: [commandItem],
+        status: commandItem.status === 'failed' ? 'failed' : commandItem.status === 'completed' ? 'completed' : 'running',
+        collapsed: commandItem.status !== 'running',
+        createdAt: now,
+        updatedAt: now,
+    });
+    return { ...state, blocks: [...state.blocks, nextBlock] };
+}
+
+function commandBlockItemFromThreadItem(item: any): CommandBlockItem {
+    return {
+        id: item.id,
+        command: safeText(item.command || '', 300),
+        detail: formatCommandDetail(item),
+        status: statusFromItem(item.status),
+        exitCode: item.exit_code ?? item.exitCode,
+    };
+}
+
+function normalizeCommandGroup(block: CommandGroupBlock): CommandGroupBlock {
+    const status = commandGroupStatus(block.commands);
+    return {
+        ...block,
+        status,
+        collapsed: status !== 'running',
+    };
+}
+
+function commandGroupStatus(commands: CommandBlockItem[]): DisplayBlockStatus {
+    if (commands.some((item) => item.status === 'failed')) return 'failed';
+    if (commands.every((item) => item.status === 'completed')) return 'completed';
+    return 'running';
+}
+
+function addToolBlock(state: StreamState, item: TimelineItem): StreamState {
+    const now = Date.now();
+    const existingIndex = state.blocks.findIndex((block) => {
+        return block.type === 'tool_group' && block.items.some((entry) => entry.id === item.id);
+    });
+    if (existingIndex >= 0) {
+        const block = state.blocks[existingIndex] as ToolGroupBlock;
+        const items = block.items.map((entry) => entry.id === item.id ? item : entry);
+        const nextBlock = normalizeToolGroup({ ...block, items, updatedAt: now });
+        return {
+            ...state,
+            blocks: state.blocks.map((entry, index) => index === existingIndex ? nextBlock : entry),
+        };
+    }
+
+    const lastBlock = state.blocks[state.blocks.length - 1];
+    if (lastBlock?.type === 'tool_group') {
+        const nextBlock = normalizeToolGroup({
+            ...lastBlock,
+            items: [...lastBlock.items, item],
+            title: toolGroupTitle([...lastBlock.items, item]),
+            updatedAt: now,
+        });
+        return {
+            ...state,
+            blocks: state.blocks.map((entry, index) => index === state.blocks.length - 1 ? nextBlock : entry),
+        };
+    }
+
+    const nextBlock = normalizeToolGroup({
+        type: 'tool_group',
+        id: `tool-group-${item.id}`,
+        title: toolGroupTitle([item]),
+        items: [item],
+        status: item.status === 'failed' ? 'failed' : item.status === 'completed' ? 'completed' : 'running',
+        collapsed: item.status !== 'running',
+        createdAt: now,
+        updatedAt: now,
+    });
+    return { ...state, blocks: [...state.blocks, nextBlock] };
+}
+
+function normalizeToolGroup(block: ToolGroupBlock): ToolGroupBlock {
+    const status = toolGroupStatus(block.items);
+    return {
+        ...block,
+        title: toolGroupTitle(block.items),
+        status,
+        collapsed: status !== 'running',
+    };
+}
+
+function toolGroupStatus(items: TimelineItem[]): DisplayBlockStatus {
+    if (items.some((item) => item.status === 'failed')) return 'failed';
+    if (items.every((item) => item.status === 'completed')) return 'completed';
+    return 'running';
+}
+
+function upsertErrorBlock(state: StreamState, id: string, title: string, detail: string): StreamState {
+    const now = Date.now();
+    const nextBlock: ErrorBlock = {
+        type: 'error',
+        id,
+        title,
+        detail: safeText(redact(detail), 1000),
+        status: 'failed',
+        collapsed: false,
+        createdAt: now,
+        updatedAt: now,
+    };
+    const existingIndex = state.blocks.findIndex((block) => block.type === 'error' && block.id === id);
+    if (existingIndex >= 0) {
+        return {
+            ...state,
+            blocks: state.blocks.map((block, index) => index === existingIndex ? { ...nextBlock, createdAt: block.createdAt } : block),
+        };
+    }
+    return { ...state, blocks: [...state.blocks, nextBlock] };
 }
 
 function headerForPhase(phase: StreamPhase) {
@@ -443,14 +779,15 @@ function formatCardMarkdown(text: unknown, limit: number) {
     return normalizeMarkdownForLark(safeText(text, limit));
 }
 
-function buildMarkdownSection(title: string, text: unknown, limit: number) {
+function buildMarkdownSection(title: string | null, text: unknown, limit: number) {
     const parsed = parseMarkdownSegments(safeText(text, limit));
-    const elements: any[] = [
-        {
+    const elements: any[] = [];
+    if (title) {
+        elements.push({
             tag: 'markdown',
             content: `**${title}**`,
-        },
-    ];
+        });
+    }
     let renderedTables = 0;
     for (const segment of parsed) {
         if (segment.type === 'table' && renderedTables < MAX_TABLES_PER_CARD) {

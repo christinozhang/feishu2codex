@@ -14,6 +14,7 @@ import {
     createApprovalState,
     createStreamState,
     formatStreamState,
+    hasCommandGroupCompletionChange,
     markStreamInterrupted,
     RuntimeCardOptions,
     shouldUpdateCard,
@@ -683,7 +684,9 @@ async function runCodexStreamToFeishu(params: {
             await rememberThread(params, thread);
 
             const now = Date.now();
-            if (shouldUpdateCard(state, nextState, lastResponseLength) && now - lastUpdateAt >= 1500) {
+            const shouldPatch = shouldUpdateCard(state, nextState, lastResponseLength);
+            const shouldPatchImmediately = hasCommandGroupCompletionChange(state, nextState);
+            if (shouldPatch && (shouldPatchImmediately || now - lastUpdateAt >= 1500)) {
                 await updateInteractiveOrText(params.sourceMessageId, targetMessageId, nextState, runtimeCardOptions(params));
                 lastState = nextState;
                 lastResponseLength = nextState.responseText.length;
