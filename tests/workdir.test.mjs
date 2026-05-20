@@ -8,15 +8,16 @@ import {
 } from '../dist/workdir.js';
 
 test('uses the home directory when the message has no explicit path', () => {
+  const home = os.homedir();
   assert.equal(resolveWorkingDirectoryForText('看下最新状态', {
-    defaultDirectory: '/Users/christino.zhang',
-  }), '/Users/christino.zhang');
+    defaultDirectory: '$HOME',
+  }), home);
 });
 
 test('uses an explicit absolute directory from the message', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-workdir-'));
   assert.equal(resolveWorkingDirectoryForText(`在 ${dir} 看下状态`, {
-    defaultDirectory: '/Users/christino.zhang',
+    defaultDirectory: '$HOME',
   }), dir);
 });
 
@@ -25,7 +26,7 @@ test('uses parent directory when the explicit path is a file', () => {
   const file = path.join(dir, 'README.md');
   fs.writeFileSync(file, '# test\n');
   assert.equal(resolveWorkingDirectoryForText(`看一下 ${file}`, {
-    defaultDirectory: '/Users/christino.zhang',
+    defaultDirectory: '$HOME',
   }), dir);
 });
 
@@ -33,14 +34,22 @@ test('expands tilde paths and strips markdown wrappers', () => {
   const home = os.homedir();
   const dir = path.join(home, 'code');
   const result = resolveWorkingDirectoryForText(`在 \`${dir.replace(home, '~')}\` 里看一下`, {
-    defaultDirectory: '/Users/christino.zhang',
+    defaultDirectory: '$HOME',
   });
 
-  assert.equal(result, fs.existsSync(dir) ? dir : '/Users/christino.zhang');
+  assert.equal(result, fs.existsSync(dir) ? dir : home);
 });
 
 test('ignores missing explicit paths and keeps the default directory', () => {
-  assert.equal(resolveWorkingDirectoryForText('看下 /Users/christino.zhang/path-that-does-not-exist-123456', {
-    defaultDirectory: '/Users/christino.zhang',
-  }), '/Users/christino.zhang');
+  const home = os.homedir();
+  assert.equal(resolveWorkingDirectoryForText('看下 $HOME/path-that-does-not-exist-123456', {
+    defaultDirectory: '$HOME',
+  }), home);
+});
+
+test('expands HOME variable in explicit paths', () => {
+  const home = os.homedir();
+  assert.equal(resolveWorkingDirectoryForText('看下 ${HOME}', {
+    defaultDirectory: '/tmp',
+  }), home);
 });

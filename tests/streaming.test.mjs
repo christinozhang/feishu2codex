@@ -76,6 +76,14 @@ test('formats agent response and command timeline from Codex events', () => {
   assert.match(text, /rg "runStreamed" src/);
 });
 
+test('formats agent card with runtime label', () => {
+  const state = createStreamState('hi', 'running', 'Claude Code/DeepSeek');
+  const card = buildAgentCard(state);
+
+  assert.equal(card.header.title.content, 'Claude Code/DeepSeek 正在处理');
+  assert.match(formatStreamState(state), /Claude Code\/DeepSeek 正在处理/);
+});
+
 test('keeps final response and completed mcp timeline', () => {
   let state = createStreamState('查 mcp');
 
@@ -393,7 +401,7 @@ test('thread picker card renders bind buttons for desktop threads', () => {
       id: 'thread-1',
       title: 'Desktop 线程',
       preview: '查看集群状态',
-      cwd: '/Users/christino.zhang/code/eks',
+      cwd: '$HOME/code/eks',
       source: 'vscode',
       status: 'idle',
       updatedAt: 1779190000,
@@ -415,7 +423,7 @@ test('thread picker text renders user-facing source labels', () => {
     id: 'thread-1',
     title: 'Desktop 线程',
     preview: '查看集群状态',
-    cwd: '/Users/christino.zhang/code/eks',
+    cwd: '$HOME/code/eks',
     source: 'vscode',
     status: 'idle',
     updatedAt: 1779190000,

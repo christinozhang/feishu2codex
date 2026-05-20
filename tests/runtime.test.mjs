@@ -7,6 +7,9 @@ import {
   mapAppServerNotification,
 } from '../dist/appServerRuntime.js';
 import {
+  createClaudeCodeEventMapper,
+} from '../dist/claudeCodeRuntime.js';
+import {
   buildRuntimePolicy,
   selectCodexRuntimeKind,
 } from '../dist/runtime.js';
@@ -26,6 +29,7 @@ test('selects exec SDK runtime unless app-server is explicitly enabled', () => {
   assert.equal(selectCodexRuntimeKind({}), 'exec-sdk');
   assert.equal(selectCodexRuntimeKind({ CODEX_RUNTIME: 'exec-sdk' }), 'exec-sdk');
   assert.equal(selectCodexRuntimeKind({ CODEX_RUNTIME: 'app-server' }), 'app-server');
+  assert.equal(selectCodexRuntimeKind({ CODEX_RUNTIME: 'claude-code' }), 'claude-code');
   assert.equal(selectCodexRuntimeKind({ CODEX_RUNTIME: 'invalid' }), 'exec-sdk');
 });
 
@@ -213,4 +217,76 @@ test('maps turn completion and app-server errors', () => {
     method: 'error',
     params: { threadId: 'thread', turnId: 'turn', willRetry: false, error: { message: 'failed' } },
   }), { type: 'error', message: 'failed' });
+});
+
+test('maps Claude Code text deltas and result into stream events', () => {
+  const mapper = createClaudeCodeEventMapper();
+
+  assert.deepEqual(mapper({
+    type: 'system',
+    subtype: 'init',
+    session_id: 'claude-session-1',
+  }), { type: 'session.updated', id: 'claude-session-1' });
+
+  assert.deepEqual(mapper({
+    type: 'stream_event',
+    event: {
+      type: 'content_block_start',
+      index: 1,
+      content_block: { type: 'text', text: '' },
+    },
+  }), null);
+
+  assert.deepEqual(mapper({
+    type: 'stream_event',
+    event: {
+      type: 'content_block_delta',
+      index: 1,
+      delta: { type: 'text_delta', text: 'hello' },
+    },
+  }), {
+    type: 'item.updated',
+    item: { type: 'agent_message', id: 'claude-message-1', text: 'hello' },
+  });
+
+  assert.deepEqual(mapper({
+    type: 'result',
+    subtype: 'success',
+    is_error: false,
+    session_id: 'claude-session-1',
+    result: 'hello',
+  }), { type: 'turn.completed' });
+});
+
+test('maps Claude Code tool use into command execution events', () => {
+  const mapper = createClaudeCodeEventMapper();
+
+  const started = mapper({
+    type: 'stream_event',
+    event: {
+      type: 'content_block_start',
+      index: 2,
+      content_block: { type: 'tool_use', id: 'tool-1', name: 'Bash', input: {} },
+    },
+  });
+  assert.equal(started.type, 'item.started');
+  assert.equal(started.item.type, 'command_execution');
+  assert.equal(started.item.command, 'Bash');
+
+  assert.equal(mapper({
+    type: 'stream_event',
+    event: {
+      type: 'content_block_delta',
+      index: 2,
+      delta: { type: 'input_json_delta', partial_json: '{"command":"pwd"}' },
+    },
+  }), null);
+
+  const completed = mapper({
+    type: 'stream_event',
+    event: { type: 'content_block_stop', index: 2 },
+  });
+  assert.equal(completed.type, 'item.completed');
+  assert.equal(completed.item.type, 'command_execution');
+  assert.equal(completed.item.command, 'pwd');
 });

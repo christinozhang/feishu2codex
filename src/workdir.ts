@@ -12,7 +12,7 @@ export function resolveWorkingDirectoryForText(text: string, params: { defaultDi
 }
 
 export function resolveWorkingDirectorySelection(text: string, params: { defaultDirectory: string }): WorkdirSelection {
-    const defaultDirectory = path.resolve(expandHome(params.defaultDirectory));
+    const defaultDirectory = path.resolve(expandPathVariables(params.defaultDirectory));
     for (const candidate of extractPathCandidates(text)) {
         const resolved = existingDirectoryForPath(candidate);
         if (resolved) {
@@ -23,12 +23,12 @@ export function resolveWorkingDirectorySelection(text: string, params: { default
 }
 
 function extractPathCandidates(text: string): string[] {
-    const matches = text.matchAll(/(?:^|[\s"'`(（])((?:~|\/)[^\s"'`，。；;、)）\]}】>]+)/g);
+    const matches = text.matchAll(/(?:^|[\s"'`(（])((?:\/[^\s"'`，。；;、)）\]}】>]+|~(?:\/[^\s"'`，。；;、)）\]}】>]*)?|\$HOME(?:\/[^\s"'`，。；;、)）\]}】>]*)?|\$\{HOME\}(?:\/[^\s"'`，。；;、)）\]}】>]*)?))/g);
     return [...matches].map((match) => stripPathBoundary(match[1])).filter(Boolean);
 }
 
 function existingDirectoryForPath(candidate: string): string | null {
-    const resolved = path.resolve(expandHome(candidate));
+    const resolved = path.resolve(expandPathVariables(candidate));
     try {
         const stat = fs.statSync(resolved);
         if (stat.isDirectory()) return resolved;
@@ -39,9 +39,12 @@ function existingDirectoryForPath(candidate: string): string | null {
     return null;
 }
 
-function expandHome(value: string): string {
+export function expandPathVariables(value: string): string {
     if (value === '~') return os.homedir();
     if (value.startsWith('~/')) return path.join(os.homedir(), value.slice(2));
+    if (value === '$HOME' || value === '${HOME}') return os.homedir();
+    if (value.startsWith('$HOME/')) return path.join(os.homedir(), value.slice(6));
+    if (value.startsWith('${HOME}/')) return path.join(os.homedir(), value.slice(8));
     return value;
 }
 

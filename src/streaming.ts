@@ -60,6 +60,7 @@ export type DisplayBlock = AssistantBlock | CommandGroupBlock | ToolGroupBlock |
 export type StreamState = {
     phase: StreamPhase;
     task: string;
+    runtimeLabel: string;
     responseText: string;
     timeline: TimelineItem[];
     blocks: DisplayBlock[];
@@ -93,19 +94,20 @@ const SECRET_PATTERNS = [
     /\b(password|token|secret)=([^&\s]+)/gi,
 ];
 
-export function createStreamState(task = '', phase: StreamPhase = 'running'): StreamState {
+export function createStreamState(task = '', phase: StreamPhase = 'running', runtimeLabel = 'Codex'): StreamState {
     return {
         phase,
         task: safeText(task, MAX_TASK_CHARS),
+        runtimeLabel: safeText(runtimeLabel, 40) || 'Codex',
         responseText: '',
         timeline: [],
         blocks: [],
     };
 }
 
-export function createApprovalState(task: string, approvalId: string, detail: string): StreamState {
+export function createApprovalState(task: string, approvalId: string, detail: string, runtimeLabel = 'Codex'): StreamState {
     const state = addTimelineItem({
-        ...createStreamState(task, 'approval'),
+        ...createStreamState(task, 'approval', runtimeLabel),
         approvalId,
     }, {
         id: approvalId,
@@ -183,7 +185,7 @@ export function hasCommandGroupCompletionChange(previous: StreamState, next: Str
 }
 
 export function buildAgentCard(state: StreamState, options: RuntimeCardOptions = {}) {
-    const header = headerForPhase(state.phase);
+    const header = headerForPhase(state.phase, state.runtimeLabel);
     const elements: any[] = [
         {
             tag: 'markdown',
@@ -562,7 +564,7 @@ function summarizeBlocksForDiff(blocks: DisplayBlock[]) {
 }
 
 export function formatStreamState(state: StreamState): string {
-    const title = headerForPhase(state.phase).title.content;
+    const title = headerForPhase(state.phase, state.runtimeLabel).title.content;
     const parts = [title, `任务:\n${safeText(state.task || '未命名任务', MAX_TEXT_CHARS)}`];
 
     if (state.responseText.trim()) {
@@ -594,7 +596,7 @@ function applyItem(state: StreamState, item: ThreadItem | any): StreamState {
                 id: item.id,
                 kind: 'reasoning',
                 title: '分析中',
-                detail: 'Codex 正在整理可见步骤。',
+                detail: `${state.runtimeLabel} 正在整理可见步骤。`,
                 status: statusFromItem(item.status),
             });
         case 'command_execution':
@@ -865,20 +867,20 @@ function upsertErrorBlock(state: StreamState, id: string, title: string, detail:
     return { ...state, blocks: [...state.blocks, nextBlock] };
 }
 
-function headerForPhase(phase: StreamPhase) {
+function headerForPhase(phase: StreamPhase, runtimeLabel = 'Codex') {
     if (phase === 'completed') {
-        return { template: 'green', title: { tag: 'plain_text', content: 'Codex 已完成' } };
+        return { template: 'green', title: { tag: 'plain_text', content: `${runtimeLabel} 已完成` } };
     }
     if (phase === 'failed') {
-        return { template: 'red', title: { tag: 'plain_text', content: 'Codex 处理失败' } };
+        return { template: 'red', title: { tag: 'plain_text', content: `${runtimeLabel} 处理失败` } };
     }
     if (phase === 'approval') {
-        return { template: 'yellow', title: { tag: 'plain_text', content: 'Codex 等待审批' } };
+        return { template: 'yellow', title: { tag: 'plain_text', content: `${runtimeLabel} 等待审批` } };
     }
     if (phase === 'interrupted') {
-        return { template: 'grey', title: { tag: 'plain_text', content: 'Codex 已被打断' } };
+        return { template: 'grey', title: { tag: 'plain_text', content: `${runtimeLabel} 已被打断` } };
     }
-    return { template: 'blue', title: { tag: 'plain_text', content: 'Codex 正在处理' } };
+    return { template: 'blue', title: { tag: 'plain_text', content: `${runtimeLabel} 正在处理` } };
 }
 
 function statusFromItem(status?: string): TimelineStatus {

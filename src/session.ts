@@ -3,6 +3,7 @@ export type SessionRecord = {
     chat_id: string;
     sender_open_id: string;
     codex_thread_id?: string;
+    claude_session_id?: string;
     model?: string;
     reasoning_effort?: string;
     first_message_id?: string;
@@ -36,7 +37,7 @@ export function normalizeSessionMap(raw: unknown): Record<string, SessionRecord>
             continue;
         }
         const item = value as Partial<SessionRecord>;
-        if (!item.codex_thread_id && !item.model && !item.reasoning_effort) {
+        if (!item.codex_thread_id && !item.claude_session_id && !item.model && !item.reasoning_effort) {
             continue;
         }
         records[item.session_key || key] = {
@@ -44,6 +45,7 @@ export function normalizeSessionMap(raw: unknown): Record<string, SessionRecord>
             chat_id: item.chat_id || key.split(':')[0] || key,
             sender_open_id: item.sender_open_id || key.split(':')[1] || 'unknown',
             codex_thread_id: item.codex_thread_id,
+            claude_session_id: item.claude_session_id,
             model: item.model,
             reasoning_effort: item.reasoning_effort,
             first_message_id: item.first_message_id,
@@ -60,17 +62,20 @@ export function buildSessionRecord(params: {
     chatId: string;
     senderOpenId: string;
     threadId: string;
+    runtimeKind?: string;
     model?: string;
     reasoningEffort?: string;
     previous?: SessionRecord;
     messageId?: string;
     userText?: string;
 }): SessionRecord {
+    const isClaude = params.runtimeKind === 'claude-code';
     return {
         session_key: params.sessionKey,
         chat_id: params.chatId,
         sender_open_id: params.senderOpenId,
-        codex_thread_id: params.threadId,
+        codex_thread_id: isClaude ? params.previous?.codex_thread_id : params.threadId,
+        claude_session_id: isClaude ? params.threadId : params.previous?.claude_session_id,
         model: params.model || params.previous?.model,
         reasoning_effort: params.reasoningEffort || params.previous?.reasoning_effort,
         first_message_id: params.previous?.first_message_id || params.messageId,
@@ -92,6 +97,7 @@ export function bindSessionThreadRecord(params: {
         chat_id: params.previous?.chat_id || chatId || params.sessionKey,
         sender_open_id: params.previous?.sender_open_id || senderOpenId || 'unknown',
         codex_thread_id: params.threadId,
+        claude_session_id: params.previous?.claude_session_id,
         model: params.previous?.model,
         reasoning_effort: params.previous?.reasoning_effort,
         first_message_id: params.previous?.first_message_id,

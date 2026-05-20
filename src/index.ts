@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { spawnSync } from 'child_process';
 import { getRunPolicy, requiresFeishuApproval } from './approval.js';
-import { buildRuntimePolicy, CodexRuntime, CodexThreadHandle, createCodexRuntime, selectCodexRuntimeKind } from './runtime.js';
+import { buildRuntimePolicy, CodexRuntime, CodexRuntimeKind, CodexThreadHandle, createCodexRuntime, selectCodexRuntimeKind } from './runtime.js';
 import { bindSessionThreadRecord, buildSessionRecord, makeSessionKey, normalizeSessionMap, SessionRecord } from './session.js';
 import { startWebServer, updateStats, addLog } from './server.js';
 import {
@@ -44,9 +44,10 @@ import {
     slashHelpText,
 } from './slash.js';
 import { getUptime } from './utils.js';
-import { resolveWorkingDirectorySelection } from './workdir.js';
+import { expandPathVariables, resolveWorkingDirectorySelection } from './workdir.js';
 
-dotenv.config();
+const envFile = process.env.FEISHU_ENV_FILE?.trim();
+dotenv.config(envFile ? { path: expandPathVariables(envFile) } : undefined);
 
 type Mention = {
     id?: {
@@ -76,7 +77,7 @@ type ApprovalRequest = {
 };
 
 const IS_WINDOWS = process.platform === 'win32';
-const SESSION_FILE = path.join(process.cwd(), 'bot_sessions.json');
+const SESSION_FILE = path.resolve(expandPathVariables(process.env.BOT_SESSION_FILE || path.join(process.cwd(), 'bot_sessions.json')));
 const APPROVAL_TIMEOUT_MS = Number(process.env.FEISHU_APPROVAL_TIMEOUT_MS || 60_000);
 const FEISHU_APPROVAL_ENABLED = getBool('FEISHU_APPROVAL_ENABLED', true);
 const FEISHU_APPROVAL_BUTTONS_ENABLED = getBool('FEISHU_APPROVAL_BUTTONS_ENABLED', true);
@@ -106,7 +107,6 @@ const client = new lark.Client({
     appSecret: process.env.FEISHU_APP_SECRET,
 });
 
-console.log('正在初始化 Codex...');
 const codexEnv = { ...process.env };
 if (process.env.CODEX_CONFIG_DIR_OVERRIDE?.trim()) {
     codexEnv.CODEX_CONFIG_DIR = process.env.CODEX_CONFIG_DIR_OVERRIDE.trim();
@@ -114,13 +114,15 @@ if (process.env.CODEX_CONFIG_DIR_OVERRIDE?.trim()) {
     delete codexEnv.CODEX_CONFIG_DIR;
 }
 
-const codexPathOverride = process.env.CODEX_PATH_OVERRIDE || process.env.CODEX_BIN || undefined;
+const codexPathOverride = expandOptionalPath(process.env.CODEX_PATH_OVERRIDE || process.env.CODEX_BIN);
+const runtimeKind = selectCodexRuntimeKind(process.env);
+console.log(`正在初始化 ${runtimeDisplayName(runtimeKind)}...`);
 const codexRuntime: CodexRuntime = createCodexRuntime({
-    kind: selectCodexRuntimeKind(process.env),
+    kind: runtimeKind,
     env: codexEnv,
     codexPathOverride,
 });
-console.log(`[Codex] runtime=${codexRuntime.kind}`);
+console.log(`[Runtime] name=${runtimeDisplayName(codexRuntime.kind)} kind=${codexRuntime.kind}`);
 const threadMap = new Map<string, ThreadCache>();
 const sessionRunners = new Map<string, SessionRunner>();
 const pendingApprovals = new Map<string, ApprovalRequest>();
@@ -142,7 +144,7 @@ wsClient.start({
         }),
 });
 
-console.log('飞书 + Codex 集成机器人正在启动...');
+console.log(`飞书 + ${runtimeDisplayName(codexRuntime.kind)} 集成机器人正在启动...`);
 
 function isRunningAsAdmin() {
     if (!IS_WINDOWS) return true;
@@ -531,7 +533,7 @@ async function runUserTaskNow(runner: SessionRunner, task: QueuedTask) {
                 `Approval policy: ${getRunPolicy(true).approvalPolicy}`,
                 `Workdir: ${resolveTaskDirectories(task.userText).workingDirectory}`,
                 `文本审批: approve ${approvalId} / deny ${approvalId}`,
-            ].join('\n'));
+            ].join('\n'), runtimeDisplayName(codexRuntime.kind));
             targetMessageId = await replyInteractive(task.sourceMessageId, approvalState);
             task.targetMessageId = targetMessageId;
             const approved = await waitForApproval(approvalId, task.senderOpenId);
@@ -726,7 +728,7 @@ async function runCodexStreamToFeishu(params: {
 }) {
     const policy = getRunPolicy(params.privileged);
     const thread = await getOrCreateThread(params.sessionKey, policy, params.userText);
-    let state = createStreamState(params.userText);
+    let state = createStreamState(params.userText, 'running', runtimeDisplayName(codexRuntime.kind));
     const cardOptions = runtimeCardOptions(params);
     const targetMessageId = params.targetMessageId || await replyInteractive(params.sourceMessageId, state, cardOptions);
     if (params.targetMessageId) {
@@ -737,7 +739,7 @@ async function runCodexStreamToFeishu(params: {
     let lastUpdateAt = Date.now();
 
     try {
-        console.log('[Codex] 正在请求 Codex...');
+        console.log(`[Runtime] requesting ${runtimeDisplayName(codexRuntime.kind)} kind=${codexRuntime.kind}`);
         const { events } = await thread.runStreamed(params.userText, { signal: params.signal });
 
         for await (const event of events) {
@@ -767,8 +769,8 @@ async function runCodexStreamToFeishu(params: {
         } else {
             const message = err instanceof Error ? err.message : String(err);
             state = updateStreamState(state, { type: 'error', message });
-            console.error('Codex 流式处理出错:', err);
-            addLog('error', `Codex 流式处理出错: ${message}`);
+            console.error(`${runtimeDisplayName(codexRuntime.kind)} 流式处理出错:`, err);
+            addLog('error', `${runtimeDisplayName(codexRuntime.kind)} 流式处理出错: ${message}`);
         }
     } finally {
         if (JSON.stringify(state) !== JSON.stringify(lastState)) {
@@ -776,7 +778,12 @@ async function runCodexStreamToFeishu(params: {
         }
     }
 
-    console.log(`[Codex 回复] ${state.responseText.substring(0, 50)}...`);
+    console.log(`[${runtimeDisplayName(codexRuntime.kind)} 回复] ${state.responseText.substring(0, 50)}...`);
+}
+
+function runtimeDisplayName(kind: CodexRuntimeKind) {
+    if (kind === 'claude-code') return process.env.CLAUDE_CODE_DISPLAY_NAME?.trim() || 'Claude Code/DeepSeek';
+    return 'Codex';
 }
 
 function runtimeCardOptions(params: {
@@ -813,7 +820,7 @@ async function getOrCreateThread(sessionKey: string, policy: { sandboxMode: stri
         return cached.thread;
     }
 
-    const existingThreadId = sessionMap[sessionKey]?.codex_thread_id;
+    const existingThreadId = getRuntimeSessionId(sessionMap[sessionKey], codexRuntime.kind);
     const runtimePolicy = buildRuntimePolicy({
         workingDirectory: directories.workingDirectory,
         desktopListDirectory: directories.desktopListDirectory,
@@ -859,13 +866,14 @@ async function rememberThread(params: {
 }, thread: CodexThreadHandle) {
     if (!thread.id) return;
     const previous = sessionMap[params.sessionKey];
-    if (previous?.codex_thread_id === thread.id && previous?.last_message_id === params.sourceMessageId) return;
+    if (getRuntimeSessionId(previous, codexRuntime.kind) === thread.id && previous?.last_message_id === params.sourceMessageId) return;
 
     sessionMap[params.sessionKey] = buildSessionRecord({
         sessionKey: params.sessionKey,
         chatId: params.chatId,
         senderOpenId: params.senderOpenId,
         threadId: thread.id,
+        runtimeKind: codexRuntime.kind,
         model: getSessionModel(params.sessionKey),
         reasoningEffort: getSessionReasoningEffort(params.sessionKey),
         previous,
@@ -877,8 +885,13 @@ async function rememberThread(params: {
     updateStats({ sessions: Object.keys(sessionMap).length });
 }
 
+function getRuntimeSessionId(record: SessionRecord | undefined, kind: CodexRuntimeKind) {
+    if (!record) return undefined;
+    return kind === 'claude-code' ? record.claude_session_id : record.codex_thread_id;
+}
+
 function getWorkingDirectory() {
-    return path.resolve(process.env.CODEX_WORKING_DIRECTORY || process.env.HOME || DEFAULT_WORKDIR);
+    return path.resolve(expandPathVariables(process.env.CODEX_WORKING_DIRECTORY || process.env.HOME || DEFAULT_WORKDIR));
 }
 
 function resolveTaskDirectories(userText: string) {
@@ -886,11 +899,16 @@ function resolveTaskDirectories(userText: string) {
     const selection = resolveWorkingDirectorySelection(userText, { defaultDirectory: defaultWorkingDirectory });
     const desktopListDirectory = selection.explicit
         ? selection.directory
-        : path.resolve(process.env.CODEX_DESKTOP_LIST_DIRECTORY || defaultWorkingDirectory);
+        : path.resolve(expandPathVariables(process.env.CODEX_DESKTOP_LIST_DIRECTORY || defaultWorkingDirectory));
     return {
         workingDirectory: selection.directory,
         desktopListDirectory,
     };
+}
+
+function expandOptionalPath(value: string | undefined) {
+    const trimmed = value?.trim();
+    return trimmed ? expandPathVariables(trimmed) : undefined;
 }
 
 function getDefaultModel() {
@@ -916,6 +934,7 @@ function setSessionModelConfig(sessionKey: string, model: string | null, reasoni
         chat_id: previous?.chat_id || sessionKey.split(':')[0] || sessionKey,
         sender_open_id: previous?.sender_open_id || sessionKey.split(':')[1] || 'unknown',
         codex_thread_id: previous?.codex_thread_id,
+        claude_session_id: previous?.claude_session_id,
         model: model || previous?.model,
         reasoning_effort: reasoningEffort || previous?.reasoning_effort,
         first_message_id: previous?.first_message_id,

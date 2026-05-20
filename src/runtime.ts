@@ -1,7 +1,8 @@
 import { Codex } from '@openai/codex-sdk';
 import { CodexAppServerRuntime } from './appServerRuntime.js';
+import { ClaudeCodeRuntime } from './claudeCodeRuntime.js';
 
-export type CodexRuntimeKind = 'exec-sdk' | 'app-server';
+export type CodexRuntimeKind = 'exec-sdk' | 'app-server' | 'claude-code';
 
 export type RuntimePolicy = {
     sandboxMode: string;
@@ -37,7 +38,10 @@ export type CodexRuntime = {
 };
 
 export function selectCodexRuntimeKind(env: Record<string, string | undefined> = process.env): CodexRuntimeKind {
-    return env.CODEX_RUNTIME?.trim().toLowerCase() === 'app-server' ? 'app-server' : 'exec-sdk';
+    const runtime = env.CODEX_RUNTIME?.trim().toLowerCase();
+    if (runtime === 'app-server') return 'app-server';
+    if (runtime === 'claude-code') return 'claude-code';
+    return 'exec-sdk';
 }
 
 export function buildRuntimePolicy(params: {
@@ -70,6 +74,12 @@ export function createCodexRuntime(params: {
     if (params.kind === 'app-server') {
         return new CodexAppServerRuntime({
             codexBin: params.codexPathOverride,
+            env: params.env,
+        });
+    }
+    if (params.kind === 'claude-code') {
+        return new ClaudeCodeRuntime({
+            claudeBin: params.env.CLAUDE_CODE_BIN?.trim(),
             env: params.env,
         });
     }

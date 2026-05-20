@@ -9,6 +9,7 @@ build/
 
 # Environment variables
 .env
+.env.*
 
 # System files
 .DS_Store
@@ -24,6 +25,7 @@ logs/
 
 # Runtime data
 bot_sessions.json
+bot_sessions.*.json
 
 # Tool configuration
 .claude/
