@@ -7,6 +7,7 @@ import {
   buildThreadPickerCard,
   createApprovalState,
   createStreamState,
+  formatThreadPickerText,
   formatStreamState,
   markStreamInterrupted,
   redact,
@@ -402,9 +403,26 @@ test('thread picker card renders bind buttons for desktop threads', () => {
 
   assert.equal(card.header.title.content, 'Codex Desktop 对话');
   assert.match(markdownText(card), /Desktop 线程/);
+  assert.match(markdownText(card), /来源: Codex Desktop\/IDE/);
+  assert.doesNotMatch(markdownText(card), /来源: vscode/);
   assert.equal(button.behaviors[0].value.action, 'bind_thread');
   assert.equal(button.behaviors[0].value.thread_id, 'thread-1');
   assert.equal(button.behaviors[0].value.session_key, 'chat:user');
+});
+
+test('thread picker text renders user-facing source labels', () => {
+  const text = formatThreadPickerText([{
+    id: 'thread-1',
+    title: 'Desktop 线程',
+    preview: '查看集群状态',
+    cwd: '/Users/christino.zhang/code/eks',
+    source: 'vscode',
+    status: 'idle',
+    updatedAt: 1779190000,
+  }]);
+
+  assert.match(text, /来源: Codex Desktop\/IDE/);
+  assert.doesNotMatch(text, /来源: vscode/);
 });
 
 test('card response renders inline code as Feishu neutral text tags and keeps fenced code language', () => {

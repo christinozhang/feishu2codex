@@ -309,7 +309,7 @@ export function buildThreadPickerCard(params: {
                 thread.preview ? formatCardMarkdown(thread.preview, 180) : '',
                 `ID: ${escapeMd(thread.id)}`,
                 `目录: ${formatCardMarkdown(thread.cwd || '未知', 180)}`,
-                `来源: ${escapeMd(thread.source || 'unknown')} · 状态: ${escapeMd(thread.status || 'unknown')} · 更新: ${formatThreadUpdatedAt(thread.updatedAt)}`,
+                `来源: ${escapeMd(formatThreadSourceForDisplay(thread.source))} · 状态: ${escapeMd(thread.status || 'unknown')} · 更新: ${formatThreadUpdatedAt(thread.updatedAt)}`,
             ].filter(Boolean).join('\n'),
         });
         if (thread.status === 'active') {
@@ -343,8 +343,13 @@ export function formatThreadPickerText(threads: CodexThreadSummary[], searchTerm
         `${index + 1}. ${thread.title || thread.preview || thread.id}`,
         `ID: ${thread.id}`,
         `目录: ${thread.cwd || '未知'}`,
-        `来源: ${thread.source || 'unknown'} · 状态: ${thread.status || 'unknown'} · 更新: ${formatThreadUpdatedAt(thread.updatedAt)}`,
+        `来源: ${formatThreadSourceForDisplay(thread.source)} · 状态: ${thread.status || 'unknown'} · 更新: ${formatThreadUpdatedAt(thread.updatedAt)}`,
     ].join('\n')).join('\n\n');
+}
+
+function formatThreadSourceForDisplay(source: string) {
+    if (source === 'vscode') return 'Codex Desktop/IDE';
+    return source || 'unknown';
 }
 
 function formatThreadUpdatedAt(value: number) {
