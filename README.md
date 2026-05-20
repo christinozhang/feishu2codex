@@ -10,7 +10,7 @@
 本项目基于原始项目
 [YUYU-gdx/feishu2codex](https://github.com/YUYU-gdx/feishu2codex)
 改造，主要增加了 Codex SDK 线程持久化、飞书审批、交互卡片时间线、
-Markdown 输出优化、slash 命令和通用安装文档。
+Markdown 输出优化、slash 命令、Codex Desktop 对话绑定和通用安装文档。
 
 ## 功能
 
@@ -23,8 +23,14 @@ Markdown 输出优化、slash 命令和通用安装文档。
 - 高风险任务使用飞书卡片按钮审批。
 - 普通问答和只读任务默认直接执行。
 - slash 命令支持 `/help`、`/skills`、`/skill`、`/mcp`、
-  `/approval`、`/queue`、`/interrupt`、`/cancel`、`/clear-queue`、
-  `/reset` 和 `/status`。
+  `/approval`、`/queue`、`/threads`、`/interrupt`、`/cancel`、
+  `/clear-queue`、`/model`、`/reset` 和 `/status`。
+- 可选使用 Codex `app-server` runtime，让新建对话更容易出现在
+  Codex Desktop 侧边栏中。
+- `/threads [keyword]` 可以检索 Codex Desktop 对话，并把选中的 thread 绑定到
+  当前飞书会话。
+- `/model [model_name] [reasoning_effort]` 可以查看或切换当前飞书会话使用的
+  Codex 模型配置。
 - 回复区使用飞书 Card JSON 2.0，支持代码块、行内代码标签和原生表格组件。
 - 本地 Web 状态接口展示运行状态和日志。
 
@@ -47,7 +53,7 @@ Markdown 输出优化、slash 命令和通用安装文档。
 1. 克隆仓库。
 
    ```bash
-   git clone https://git.garena.com/christino.zhang/feishu2codex.git
+   git clone https://github.com/christinozhang/feishu2codex.git
    cd feishu2codex
    ```
 
@@ -104,6 +110,8 @@ CODEX_PRIVILEGED_APPROVAL_POLICY=never
 
 CODEX_PATH_OVERRIDE=
 CODEX_WORKING_DIRECTORY=./workspace
+CODEX_RUNTIME=exec-sdk
+CODEX_DESKTOP_LIST_DIRECTORY=
 CODEX_SKIP_GIT_CHECK=true
 CODEX_REASONING_EFFORT=medium
 CODEX_WEB_SEARCH_ENABLED=true
@@ -121,9 +129,14 @@ WEB_PORT=3000
 - `FEISHU_APPROVAL_BUTTONS_ENABLED`：审批卡片是否显示按钮。
 - `CODEX_DEFAULT_SANDBOX_MODE`：普通任务使用的 Codex sandbox。
 - `CODEX_PRIVILEGED_SANDBOX_MODE`：审批通过后使用的 Codex sandbox。
+- `CODEX_RUNTIME`：Codex 运行后端。默认 `exec-sdk` 使用
+  `@openai/codex-sdk` 和 `codex exec`；设置为 `app-server` 时使用
+  `codex app-server`，新建对话更容易被 Codex Desktop 索引。
 - `CODEX_PATH_OVERRIDE`：Codex 可执行文件路径。macOS 中如果 SDK 自带
   二进制被系统拦截，可以填写 Codex.app 内的已签名命令行入口。
 - `CODEX_WORKING_DIRECTORY`：Codex 执行任务时使用的工作目录。
+- `CODEX_DESKTOP_LIST_DIRECTORY`：仅用于 Codex Desktop 侧边栏分组和
+  `/threads` 检索范围。留空时使用 `CODEX_WORKING_DIRECTORY`。
 - `WEB_PORT`：本地状态服务端口，默认是 `3000`。
 
 可以通过以下命令查询机器人身份标识。
@@ -230,9 +243,13 @@ macOS 可以用 LaunchAgent 管理进程，Linux 可以用 systemd 管理进程�
 - `/mcp`：查看当前 Codex CLI 可见 MCP。
 - `/approval`：查看审批策略。
 - `/queue`：查看当前任务和等待队列。
+- `/threads [keyword]`：检索 Codex Desktop 对话，并用卡片按钮绑定到当前
+  飞书会话。
 - `/interrupt <task>`：打断当前任务，并把新任务放到队首执行。
 - `/cancel <task_id>`：取消一个等待任务。
 - `/clear-queue`：清空当前会话中属于当前用户的等待任务。
+- `/model [model_name] [reasoning_effort]`：查看或切换当前飞书会话使用的
+  Codex 模型配置。
 - `/reset`：清空当前飞书会话绑定的 Codex thread。
 - `/status`：查看机器人状态。
 
@@ -252,6 +269,16 @@ code block，行内代码会转换成飞书 `text_tag` 标签，Markdown 表格�
 
 表格组件遵循飞书限制：单张卡片最多渲染 5 个表格，每个表格最多展示 6 列和
 10 行。超出部分会降级为列表文本，避免飞书拒绝创建或更新卡片。
+
+## Codex Desktop 对话绑定
+
+当 `CODEX_RUNTIME=app-server` 时，机器人通过 `codex app-server` 创建和恢复
+thread。该模式创建的 thread 更容易出现在 Codex Desktop 侧边栏中。
+
+发送 `/threads [keyword]` 后，机器人会返回最近的 Codex Desktop 对话卡片。
+卡片只展示 thread 标题、工作目录和更新时间。点击 **绑定** 后，当前飞书会话
+会记录对应的 `codex_thread_id`。后续消息会继续这个 thread，但不会把历史聊天
+内容回放到飞书卡片中。
 
 ## 会话与数据文件
 
