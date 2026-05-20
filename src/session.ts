@@ -80,6 +80,27 @@ export function buildSessionRecord(params: {
     };
 }
 
+export function bindSessionThreadRecord(params: {
+    sessionKey: string;
+    threadId: string;
+    previous?: SessionRecord;
+    title?: string;
+}): SessionRecord {
+    const [chatId, senderOpenId] = params.sessionKey.split(':');
+    return {
+        session_key: params.sessionKey,
+        chat_id: params.previous?.chat_id || chatId || params.sessionKey,
+        sender_open_id: params.previous?.sender_open_id || senderOpenId || 'unknown',
+        codex_thread_id: params.threadId,
+        model: params.previous?.model,
+        reasoning_effort: params.previous?.reasoning_effort,
+        first_message_id: params.previous?.first_message_id,
+        last_message_id: params.previous?.last_message_id,
+        title: params.title || params.previous?.title,
+        updated_at: new Date().toISOString(),
+    };
+}
+
 function titleFromText(text: string) {
     const normalized = text.replace(/\s+/g, ' ').trim();
     if (!normalized) return undefined;

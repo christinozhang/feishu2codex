@@ -5,7 +5,7 @@
   "main": "dist/index.js",
   "type": "module",
   "scripts": {
-    "build": "bun build ./src/index.ts ./src/server.ts ./src/utils.ts ./src/streaming.ts ./src/session.ts ./src/approval.ts ./src/slash.ts ./src/queue.ts --target=node --outdir=dist --external=@larksuiteoapi/node-sdk --external=@openai/codex-sdk --external=express --external=cors --external=dotenv",
+    "build": "bun build ./src/index.ts ./src/server.ts ./src/utils.ts ./src/streaming.ts ./src/session.ts ./src/approval.ts ./src/slash.ts ./src/queue.ts ./src/runtime.ts ./src/appServerRuntime.ts ./src/workdir.ts --target=node --outdir=dist --entry-naming='[name].[ext]' --external=@larksuiteoapi/node-sdk --external=@openai/codex-sdk --external=express --external=cors --external=dotenv",
     "start": "node dist/index.js",
     "dev": "npm run build && node dist/index.js",
     "test": "npm run build && node --test tests/*.test.mjs"

@@ -30,6 +30,7 @@ test('help text includes supported commands', () => {
   assert.match(help, /\/cancel <task_id>/);
   assert.match(help, /\/clear-queue/);
   assert.match(help, /\/model/);
+  assert.match(help, /\/threads/);
   assert.match(help, /开启新对话/);
 });
 

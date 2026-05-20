@@ -1,18 +1,20 @@
 import * as lark from '@larksuiteoapi/node-sdk';
-import { Codex, Thread } from '@openai/codex-sdk';
 import dotenv from 'dotenv';
 import * as fs from 'fs';
 import * as path from 'path';
 import { spawnSync } from 'child_process';
 import { getRunPolicy, requiresFeishuApproval } from './approval.js';
-import { buildSessionRecord, makeSessionKey, normalizeSessionMap, SessionRecord } from './session.js';
+import { buildRuntimePolicy, CodexRuntime, CodexThreadHandle, createCodexRuntime, selectCodexRuntimeKind } from './runtime.js';
+import { bindSessionThreadRecord, buildSessionRecord, makeSessionKey, normalizeSessionMap, SessionRecord } from './session.js';
 import { startWebServer, updateStats, addLog } from './server.js';
 import {
     buildAgentCard,
     buildQueueSummaryCard,
     buildQueuedTaskCard,
+    buildThreadPickerCard,
     createApprovalState,
     createStreamState,
+    formatThreadPickerText,
     formatStreamState,
     hasCommandGroupCompletionChange,
     markStreamInterrupted,
@@ -42,6 +44,7 @@ import {
     slashHelpText,
 } from './slash.js';
 import { getUptime } from './utils.js';
+import { resolveWorkingDirectorySelection } from './workdir.js';
 
 dotenv.config();
 
@@ -55,9 +58,12 @@ type Mention = {
 };
 
 type ThreadCache = {
-    thread: Thread;
+    thread: CodexThreadHandle;
+    runtimeKind: string;
     sandboxMode: string;
     approvalPolicy: string;
+    workingDirectory: string;
+    desktopListDirectory: string;
     model?: string;
     reasoningEffort?: string;
 };
@@ -109,7 +115,12 @@ if (process.env.CODEX_CONFIG_DIR_OVERRIDE?.trim()) {
 }
 
 const codexPathOverride = process.env.CODEX_PATH_OVERRIDE || process.env.CODEX_BIN || undefined;
-const codex = new Codex({ env: codexEnv, codexPathOverride });
+const codexRuntime: CodexRuntime = createCodexRuntime({
+    kind: selectCodexRuntimeKind(process.env),
+    env: codexEnv,
+    codexPathOverride,
+});
+console.log(`[Codex] runtime=${codexRuntime.kind}`);
 const threadMap = new Map<string, ThreadCache>();
 const sessionRunners = new Map<string, SessionRunner>();
 const pendingApprovals = new Map<string, ApprovalRequest>();
@@ -352,6 +363,26 @@ async function handleSlashCommand(userText: string, params: {
         }), formatQueueAsText(snapshot.current, snapshot.queue));
         return { handled: true };
     }
+    if (command.name === 'threads') {
+        if (!codexRuntime.listThreads) {
+            await replyText(params.messageId, '当前 Codex runtime 不支持 Desktop 对话检索。请使用 CODEX_RUNTIME=app-server。');
+            return { handled: true };
+        }
+        try {
+            const threads = await codexRuntime.listThreads({ searchTerm: command.args, limit: 10 });
+            await replyInteractiveCard(params.messageId, buildThreadPickerCard({
+                sessionKey: params.sessionKey,
+                requesterOpenId: params.senderOpenId,
+                sourceMessageId: params.messageId,
+                searchTerm: command.args,
+                threads,
+            }), formatThreadPickerText(threads, command.args));
+        } catch (e) {
+            const message = e instanceof Error ? e.message : String(e);
+            await replyText(params.messageId, `检索 Codex Desktop 对话失败: ${message}`);
+        }
+        return { handled: true };
+    }
     if (command.name === 'cancel') {
         const runner = getOrCreateRunner(sessionRunners, params.sessionKey);
         const removed = removeQueuedTask(runner, command.args.trim(), params.senderOpenId);
@@ -498,7 +529,7 @@ async function runUserTaskNow(runner: SessionRunner, task: QueuedTask) {
             const approvalState = createApprovalState(task.userText, approvalId, [
                 `Sandbox: ${getRunPolicy(true).sandboxMode}`,
                 `Approval policy: ${getRunPolicy(true).approvalPolicy}`,
-                `Workdir: ${getWorkingDirectory()}`,
+                `Workdir: ${resolveTaskDirectories(task.userText).workingDirectory}`,
                 `文本审批: approve ${approvalId} / deny ${approvalId}`,
             ].join('\n'));
             targetMessageId = await replyInteractive(task.sourceMessageId, approvalState);
@@ -588,8 +619,38 @@ async function handleCardAction(data: any) {
         return undefined;
     }
 
+    if (action === 'bind_thread') {
+        await handleBindThreadCardAction(value, senderOpenId);
+        return undefined;
+    }
+
     await handleQueueCardAction(action, value, senderOpenId);
     return undefined;
+}
+
+async function handleBindThreadCardAction(value: any, senderOpenId: string) {
+    const sessionKey = value.session_key || value.sessionKey;
+    const threadId = value.thread_id || value.threadId;
+    const requesterOpenId = value.requester_open_id || value.requesterOpenId || senderOpenId;
+    const sourceMessageId = value.source_message_id || value.sourceMessageId;
+    const title = value.thread_title || value.threadTitle;
+    if (!sessionKey || !threadId) return;
+    if (requesterOpenId !== 'unknown' && senderOpenId !== 'unknown' && requesterOpenId !== senderOpenId) {
+        if (sourceMessageId) await replyText(sourceMessageId, '只有检索发起人可以绑定此对话。');
+        return;
+    }
+
+    sessionMap[sessionKey] = bindSessionThreadRecord({
+        sessionKey,
+        threadId,
+        previous: sessionMap[sessionKey],
+        title,
+    });
+    threadMap.delete(sessionKey);
+    saveSessions();
+    updateStats({ sessions: Object.keys(sessionMap).length });
+    addLog('info', `会话绑定 Desktop thread: ${sessionKey} -> ${threadId}`);
+    if (sourceMessageId) await replyText(sourceMessageId, `已绑定 Codex Desktop 对话: ${threadId}`);
 }
 
 async function handleQueueCardAction(action: string, value: any, senderOpenId: string) {
@@ -664,7 +725,7 @@ async function runCodexStreamToFeishu(params: {
     isInterrupted: () => boolean;
 }) {
     const policy = getRunPolicy(params.privileged);
-    const thread = await getOrCreateThread(params.sessionKey, policy);
+    const thread = await getOrCreateThread(params.sessionKey, policy, params.userText);
     let state = createStreamState(params.userText);
     const cardOptions = runtimeCardOptions(params);
     const targetMessageId = params.targetMessageId || await replyInteractive(params.sourceMessageId, state, cardOptions);
@@ -734,40 +795,58 @@ function runtimeCardOptions(params: {
     };
 }
 
-async function getOrCreateThread(sessionKey: string, policy: { sandboxMode: string; approvalPolicy: string }): Promise<Thread> {
+async function getOrCreateThread(sessionKey: string, policy: { sandboxMode: string; approvalPolicy: string }, userText: string): Promise<CodexThreadHandle> {
     const cached = threadMap.get(sessionKey);
     const model = getSessionModel(sessionKey);
     const reasoningEffort = getSessionReasoningEffort(sessionKey);
-    if (cached && cached.sandboxMode === policy.sandboxMode && cached.approvalPolicy === policy.approvalPolicy && cached.model === model && cached.reasoningEffort === reasoningEffort) {
+    const directories = resolveTaskDirectories(userText);
+    if (
+        cached &&
+        cached.runtimeKind === codexRuntime.kind &&
+        cached.sandboxMode === policy.sandboxMode &&
+        cached.approvalPolicy === policy.approvalPolicy &&
+        cached.workingDirectory === directories.workingDirectory &&
+        cached.desktopListDirectory === directories.desktopListDirectory &&
+        cached.model === model &&
+        cached.reasoningEffort === reasoningEffort
+    ) {
         return cached.thread;
     }
 
     const existingThreadId = sessionMap[sessionKey]?.codex_thread_id;
-    const threadOptions = {
+    const runtimePolicy = buildRuntimePolicy({
+        workingDirectory: directories.workingDirectory,
+        desktopListDirectory: directories.desktopListDirectory,
+        sandboxMode: policy.sandboxMode,
+        approvalPolicy: policy.approvalPolicy,
         model,
-        skipGitRepoCheck: getBool('CODEX_SKIP_GIT_CHECK', true),
-        sandboxMode: policy.sandboxMode as any,
-        approvalPolicy: policy.approvalPolicy as any,
-        modelReasoningEffort: reasoningEffort as any,
-        webSearchEnabled: getBool('CODEX_WEB_SEARCH_ENABLED', true),
-        workingDirectory: getWorkingDirectory(),
-    };
+        reasoningEffort,
+    });
 
-    let thread: Thread;
+    let thread: CodexThreadHandle;
     if (existingThreadId) {
         try {
             console.log(`[会话 ${sessionKey}] 恢复历史线程: ${existingThreadId}`);
-            thread = codex.resumeThread(existingThreadId, threadOptions);
+            thread = await codexRuntime.resumeThread(existingThreadId, runtimePolicy);
         } catch (e) {
             console.warn(`[会话 ${sessionKey}] 恢复失败，将创建新线程: ${e}`);
-            thread = codex.startThread(threadOptions);
+            thread = await codexRuntime.startThread(runtimePolicy);
         }
     } else {
         console.log(`[会话 ${sessionKey}] 创建全新线程`);
-        thread = codex.startThread(threadOptions);
+        thread = await codexRuntime.startThread(runtimePolicy);
     }
 
-    threadMap.set(sessionKey, { thread, sandboxMode: policy.sandboxMode, approvalPolicy: policy.approvalPolicy, model, reasoningEffort });
+    threadMap.set(sessionKey, {
+        thread,
+        runtimeKind: codexRuntime.kind,
+        sandboxMode: policy.sandboxMode,
+        approvalPolicy: policy.approvalPolicy,
+        workingDirectory: directories.workingDirectory,
+        desktopListDirectory: directories.desktopListDirectory,
+        model,
+        reasoningEffort,
+    });
     return thread;
 }
 
@@ -777,7 +856,7 @@ async function rememberThread(params: {
     sessionKey: string;
     sourceMessageId: string;
     userText: string;
-}, thread: Thread) {
+}, thread: CodexThreadHandle) {
     if (!thread.id) return;
     const previous = sessionMap[params.sessionKey];
     if (previous?.codex_thread_id === thread.id && previous?.last_message_id === params.sourceMessageId) return;
@@ -799,7 +878,19 @@ async function rememberThread(params: {
 }
 
 function getWorkingDirectory() {
-    return path.resolve(process.env.CODEX_WORKING_DIRECTORY || DEFAULT_WORKDIR);
+    return path.resolve(process.env.CODEX_WORKING_DIRECTORY || process.env.HOME || DEFAULT_WORKDIR);
+}
+
+function resolveTaskDirectories(userText: string) {
+    const defaultWorkingDirectory = getWorkingDirectory();
+    const selection = resolveWorkingDirectorySelection(userText, { defaultDirectory: defaultWorkingDirectory });
+    const desktopListDirectory = selection.explicit
+        ? selection.directory
+        : path.resolve(process.env.CODEX_DESKTOP_LIST_DIRECTORY || defaultWorkingDirectory);
+    return {
+        workingDirectory: selection.directory,
+        desktopListDirectory,
+    };
 }
 
 function getDefaultModel() {

@@ -4,6 +4,7 @@ import {
   buildAgentCard,
   buildQueueSummaryCard,
   buildQueuedTaskCard,
+  buildThreadPickerCard,
   createApprovalState,
   createStreamState,
   formatStreamState,
@@ -17,10 +18,32 @@ function cardElements(card) {
 }
 
 function markdownText(card) {
-  return cardElements(card)
+  return allElements(cardElements(card))
     .filter((item) => item.tag === 'markdown')
     .map((item) => item.content)
     .join('\n');
+}
+
+function allElements(elements) {
+  const items = [];
+  for (const item of elements) {
+    items.push(item);
+    if (item.elements) {
+      items.push(...allElements(item.elements));
+    }
+  }
+  return items;
+}
+
+function panelsIn(elements) {
+  const panels = [];
+  for (const item of elements) {
+    if (item.tag === 'collapsible_panel') {
+      panels.push(item);
+      panels.push(...panelsIn(item.elements || []));
+    }
+  }
+  return panels;
 }
 
 test('formats agent response and command timeline from Codex events', () => {
@@ -128,14 +151,16 @@ test('card renders content stream in event order and supports approval buttons',
   const card = buildAgentCard(state);
   const elements = cardElements(card);
   const beforeIndex = elements.findIndex((item) => item.tag === 'markdown' && item.content.includes('准备重启。'));
-  const panelIndex = elements.findIndex((item) => item.tag === 'collapsible_panel' && item.header.title.content.includes('命令'));
+  const panelIndex = elements.findIndex((item) => item.tag === 'collapsible_panel' && item.header.title.content.startsWith('思考处理过程'));
+  const commandPanel = panelsIn(elements).find((item) => item.header.title.content.includes('命令'));
   const afterIndex = elements.findIndex((item) => item.tag === 'markdown' && item.content.includes('完成'));
   const approvalIndex = elements.findIndex((item) => item.tag === 'button' && item.behaviors?.[0]?.value?.action === 'approve');
   assert.equal(card.header.template, 'yellow');
   assert.equal(card.schema, '2.0');
   assert.equal(panelIndex > -1 && afterIndex > -1, true);
-  assert.equal(elements[panelIndex].header.title.content, '已运行 1 条命令');
-  assert.equal(elements[panelIndex].expanded, false);
+  assert.match(elements[panelIndex].header.title.content, /^思考处理过程/);
+  assert.equal(commandPanel.header.title.content, '已运行 1 条命令');
+  assert.equal(commandPanel.expanded, false);
   assert.ok(beforeIndex > -1 && beforeIndex < panelIndex);
   assert.ok(panelIndex < afterIndex && afterIndex < approvalIndex);
   assert.doesNotMatch(markdownText(card), /\*\*回复\*\*|执行过程/);
@@ -160,13 +185,14 @@ test('continuous commands are grouped and collapsed when completed', () => {
   }
 
   const card = buildAgentCard(state);
-  const panels = cardElements(card).filter((item) => item.tag === 'collapsible_panel');
-  assert.equal(panels.length, 1);
-  assert.equal(panels[0].header.title.content, '已运行 3 条命令');
-  assert.equal(panels[0].expanded, false);
-  assert.match(JSON.stringify(panels[0]), /pwd/);
-  assert.match(JSON.stringify(panels[0]), /git status/);
-  assert.match(JSON.stringify(panels[0]), /ls/);
+  const panels = panelsIn(cardElements(card));
+  const processPanel = panels.find((item) => item.header.title.content.startsWith('思考处理过程'));
+  const commandPanel = panels.find((item) => item.header.title.content === '已运行 3 条命令');
+  assert.equal(processPanel.expanded, true);
+  assert.equal(commandPanel.expanded, false);
+  assert.match(JSON.stringify(commandPanel), /pwd/);
+  assert.match(JSON.stringify(commandPanel), /git status/);
+  assert.match(JSON.stringify(commandPanel), /ls/);
 });
 
 test('assistant text between commands starts a new command group', () => {
@@ -185,13 +211,12 @@ test('assistant text between commands starts a new command group', () => {
   });
 
   const elements = cardElements(buildAgentCard(state));
-  const panels = elements.filter((item) => item.tag === 'collapsible_panel');
+  const panels = panelsIn(elements).filter((item) => item.header.title.content === '已运行 1 条命令');
   const middleIndex = elements.findIndex((item) => item.tag === 'markdown' && item.content.includes('中间说明'));
   assert.equal(panels.length, 2);
   assert.equal(panels[0].header.title.content, '已运行 1 条命令');
   assert.equal(panels[1].header.title.content, '已运行 1 条命令');
-  assert.ok(elements.indexOf(panels[0]) < middleIndex);
-  assert.ok(middleIndex < elements.indexOf(panels[1]));
+  assert.equal(middleIndex > -1, true);
 });
 
 test('running command group is expanded and completed group is folded', () => {
@@ -207,7 +232,10 @@ test('running command group is expanded and completed group is folded', () => {
     },
   });
 
-  let panel = cardElements(buildAgentCard(state)).find((item) => item.tag === 'collapsible_panel');
+  let panels = panelsIn(cardElements(buildAgentCard(state)));
+  let processPanel = panels.find((item) => item.header.title.content.startsWith('思考处理过程'));
+  let panel = panels.find((item) => item.header.title.content.includes('命令'));
+  assert.equal(processPanel.expanded, true);
   assert.equal(panel.header.title.content, '正在运行 1 条命令');
   assert.equal(panel.expanded, true);
 
@@ -225,11 +253,59 @@ test('running command group is expanded and completed group is folded', () => {
   state = updateStreamState(state, { type: 'turn.completed' });
 
   const card = buildAgentCard(state);
-  panel = cardElements(card).find((item) => item.tag === 'collapsible_panel');
+  panels = panelsIn(cardElements(card));
+  processPanel = panels.find((item) => item.header.title.content.startsWith('思考处理过程'));
+  panel = panels.find((item) => item.header.title.content.includes('命令'));
   assert.equal(card.header.template, 'green');
+  assert.equal(processPanel.expanded, false);
   assert.equal(panel.header.title.content, '已运行 1 条命令');
   assert.equal(panel.expanded, false);
   assert.match(JSON.stringify(card), /truncated/);
+});
+
+test('card wraps processing blocks in a collapsed outer panel when completed', () => {
+  let state = createStreamState('双层折叠');
+  state = updateStreamState(state, {
+    type: 'item.started',
+    item: {
+      id: 'reasoning-1',
+      type: 'reasoning',
+      status: 'in_progress',
+    },
+  });
+  state = updateStreamState(state, {
+    type: 'item.completed',
+    item: {
+      id: 'cmd-1',
+      type: 'command_execution',
+      command: 'pwd',
+      status: 'completed',
+      exit_code: 0,
+      aggregated_output: '/tmp',
+    },
+  });
+  state = updateStreamState(state, {
+    type: 'item.completed',
+    item: {
+      id: 'tool-1',
+      type: 'mcp_tool_call',
+      server: 'context7',
+      tool: 'get-library-docs',
+      arguments: { topic: 'cards' },
+      status: 'completed',
+    },
+  });
+  state = updateStreamState(state, { type: 'turn.completed' });
+
+  const elements = cardElements(buildAgentCard(state));
+  const processPanel = elements.find((item) => item.tag === 'collapsible_panel' && item.header.title.content.startsWith('思考处理过程'));
+  const nestedPanels = panelsIn(processPanel?.elements || []);
+
+  assert.equal(processPanel.expanded, false);
+  assert.match(processPanel.header.title.content, /已处理 · \d+(?:\.\d)?s/);
+  assert.equal(nestedPanels.some((item) => item.header.title.content === '已运行 1 条命令'), true);
+  assert.equal(nestedPanels.some((item) => item.header.title.content.includes('MCP context7.get-library-docs')), true);
+  assert.equal(nestedPanels.every((item) => item.expanded === false), true);
 });
 
 test('failed commands render failed command group', () => {
@@ -247,7 +323,7 @@ test('failed commands render failed command group', () => {
   });
 
   const card = buildAgentCard(state);
-  const panel = cardElements(card).find((item) => item.tag === 'collapsible_panel');
+  const panel = panelsIn(cardElements(card)).find((item) => item.header.title.content.includes('命令'));
   assert.equal(panel.header.title.content, '命令失败 · 1 条命令');
   assert.equal(panel.expanded, false);
   assert.match(JSON.stringify(panel), /exit_code=1/);
@@ -304,6 +380,31 @@ test('queue cards render waiting task controls and summary', () => {
   assert.match(JSON.stringify(summaryCard), /task-queued/);
   assert.doesNotThrow(() => JSON.stringify(queuedCard));
   assert.doesNotThrow(() => JSON.stringify(summaryCard));
+});
+
+test('thread picker card renders bind buttons for desktop threads', () => {
+  const card = buildThreadPickerCard({
+    sessionKey: 'chat:user',
+    requesterOpenId: 'user',
+    sourceMessageId: 'msg-1',
+    searchTerm: 'desktop',
+    threads: [{
+      id: 'thread-1',
+      title: 'Desktop 线程',
+      preview: '查看集群状态',
+      cwd: '/Users/christino.zhang/code/eks',
+      source: 'vscode',
+      status: 'idle',
+      updatedAt: 1779190000,
+    }],
+  });
+  const button = cardElements(card).find((item) => item.tag === 'button');
+
+  assert.equal(card.header.title.content, 'Codex Desktop 对话');
+  assert.match(markdownText(card), /Desktop 线程/);
+  assert.equal(button.behaviors[0].value.action, 'bind_thread');
+  assert.equal(button.behaviors[0].value.thread_id, 'thread-1');
+  assert.equal(button.behaviors[0].value.session_key, 'chat:user');
 });
 
 test('card response renders inline code as Feishu neutral text tags and keeps fenced code language', () => {

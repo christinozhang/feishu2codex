@@ -1,5 +1,6 @@
 import type { ThreadEvent, ThreadItem } from '@openai/codex-sdk';
 import type { QueuedTask } from './queue.js';
+import type { CodexThreadSummary } from './runtime.js';
 
 export type StreamPhase = 'approval' | 'running' | 'completed' | 'failed' | 'interrupted';
 export type TimelineStatus = 'running' | 'completed' | 'failed';
@@ -118,7 +119,7 @@ export function createApprovalState(task: string, approvalId: string, detail: st
 
 export function updateStreamState(state: StreamState, event: ThreadEvent | any): StreamState {
     if (event.type === 'turn.completed') {
-        return { ...state, phase: 'completed' };
+        return completeRunningWork({ ...state, phase: 'completed' });
     }
 
     if (event.type === 'turn.failed') {
@@ -190,7 +191,7 @@ export function buildAgentCard(state: StreamState, options: RuntimeCardOptions =
         },
     ];
 
-    elements.push(...buildBlockElements(state.blocks));
+    elements.push(...buildBlockElements(state.blocks, state.phase));
 
     if (state.phase === 'approval' && state.approvalId && options.includeApprovalButtons !== false) {
         elements.push(
@@ -282,6 +283,75 @@ export function buildQueueSummaryCard(params: {
     );
 }
 
+export function buildThreadPickerCard(params: {
+    sessionKey: string;
+    requesterOpenId: string;
+    sourceMessageId: string;
+    searchTerm?: string;
+    threads: CodexThreadSummary[];
+}) {
+    const elements: any[] = [];
+    const search = params.searchTerm?.trim();
+    elements.push({
+        tag: 'markdown',
+        content: [
+            search ? `**检索词**\n${formatCardMarkdown(search, 120)}` : '',
+            params.threads.length === 0 ? '未找到可绑定的 Codex Desktop 对话。' : `共 ${params.threads.length} 条候选。`,
+        ].filter(Boolean).join('\n\n'),
+    });
+
+    for (const thread of params.threads.slice(0, 10)) {
+        const title = thread.title || thread.preview || thread.id;
+        elements.push({
+            tag: 'markdown',
+            content: [
+                `**${formatCardMarkdown(title, 100)}**`,
+                thread.preview ? formatCardMarkdown(thread.preview, 180) : '',
+                `ID: ${escapeMd(thread.id)}`,
+                `目录: ${formatCardMarkdown(thread.cwd || '未知', 180)}`,
+                `来源: ${escapeMd(thread.source || 'unknown')} · 状态: ${escapeMd(thread.status || 'unknown')} · 更新: ${formatThreadUpdatedAt(thread.updatedAt)}`,
+            ].filter(Boolean).join('\n'),
+        });
+        if (thread.status === 'active') {
+            elements.push({
+                tag: 'markdown',
+                content: '运行中的对话暂不绑定。',
+            });
+        } else {
+            elements.push(buildCallbackButton('继续此对话', 'primary', {
+                action: 'bind_thread',
+                session_key: params.sessionKey,
+                requester_open_id: params.requesterOpenId,
+                source_message_id: params.sourceMessageId,
+                thread_id: thread.id,
+                thread_title: title,
+            }));
+        }
+    }
+
+    return buildCard(
+        { template: 'blue', title: { tag: 'plain_text', content: 'Codex Desktop 对话' } },
+        elements,
+    );
+}
+
+export function formatThreadPickerText(threads: CodexThreadSummary[], searchTerm = '') {
+    if (threads.length === 0) {
+        return searchTerm ? `未找到匹配 Codex Desktop 对话: ${searchTerm}` : '未找到 Codex Desktop 对话';
+    }
+    return threads.map((thread, index) => [
+        `${index + 1}. ${thread.title || thread.preview || thread.id}`,
+        `ID: ${thread.id}`,
+        `目录: ${thread.cwd || '未知'}`,
+        `来源: ${thread.source || 'unknown'} · 状态: ${thread.status || 'unknown'} · 更新: ${formatThreadUpdatedAt(thread.updatedAt)}`,
+    ].join('\n')).join('\n\n');
+}
+
+function formatThreadUpdatedAt(value: number) {
+    if (!value) return '未知';
+    return new Date(value * 1000).toLocaleString('zh-CN', { hour12: false });
+}
+
 function buildCard(header: any, elements: any[]) {
     return {
         schema: '2.0',
@@ -312,7 +382,7 @@ function buildCallbackButton(content: string, type: 'default' | 'primary' | 'dan
     };
 }
 
-function buildBlockElements(blocks: DisplayBlock[]) {
+function buildBlockElements(blocks: DisplayBlock[], phase: StreamPhase) {
     if (blocks.length === 0) return [];
     const visibleBlocks = blocks.slice(-MAX_VISIBLE_BLOCKS);
     const hiddenCount = blocks.length - visibleBlocks.length;
@@ -323,10 +393,63 @@ function buildBlockElements(blocks: DisplayBlock[]) {
             content: `较早内容已压缩 · ${hiddenCount} 条`,
         });
     }
+    const processBlocks = visibleBlocks.filter(isProcessBlock);
+    let processPanelAdded = false;
     for (const block of visibleBlocks) {
+        if (isProcessBlock(block)) {
+            if (!processPanelAdded) {
+                elements.push(buildProcessPanel(processBlocks, phase));
+                processPanelAdded = true;
+            }
+            continue;
+        }
         elements.push(...renderBlock(block));
     }
     return elements;
+}
+
+function isProcessBlock(block: DisplayBlock) {
+    return block.type !== 'assistant' && !isApprovalBlock(block);
+}
+
+function isApprovalBlock(block: DisplayBlock) {
+    return block.type === 'tool_group' && block.items.every((item) => item.kind === 'approval');
+}
+
+function buildProcessPanel(blocks: DisplayBlock[], phase: StreamPhase) {
+    return {
+        tag: 'collapsible_panel',
+        expanded: shouldExpandProcessPanel(blocks, phase),
+        header: {
+            title: {
+                tag: 'plain_text',
+                content: processPanelTitle(blocks, phase),
+            },
+        },
+        elements: blocks.flatMap(renderBlock),
+    };
+}
+
+function shouldExpandProcessPanel(blocks: DisplayBlock[], phase: StreamPhase) {
+    if (phase === 'completed') return false;
+    if (phase === 'running' || phase === 'approval') return true;
+    return blocks.some((block) => block.status === 'failed');
+}
+
+function processPanelTitle(blocks: DisplayBlock[], phase: StreamPhase) {
+    const elapsed = formatElapsedSeconds(blocks);
+    if (phase === 'completed') return `思考处理过程 · 已处理 · ${elapsed}`;
+    if (phase === 'failed') return `思考处理过程 · 处理失败 · ${elapsed}`;
+    if (phase === 'interrupted') return `思考处理过程 · 已被打断 · ${elapsed}`;
+    return `思考处理过程 · 处理中 · ${elapsed}`;
+}
+
+function formatElapsedSeconds(blocks: DisplayBlock[]) {
+    const first = Math.min(...blocks.map((block) => block.createdAt));
+    const last = Math.max(...blocks.map((block) => block.updatedAt));
+    const seconds = Math.max(0, (last - first) / 1000);
+    if (seconds < 10) return `${Number(seconds.toFixed(1))}s`;
+    return `${Math.round(seconds)}s`;
 }
 
 function renderBlock(block: DisplayBlock): any[] {
@@ -689,6 +812,30 @@ function toolGroupStatus(items: TimelineItem[]): DisplayBlockStatus {
     if (items.some((item) => item.status === 'failed')) return 'failed';
     if (items.every((item) => item.status === 'completed')) return 'completed';
     return 'running';
+}
+
+function completeRunningWork(state: StreamState): StreamState {
+    return {
+        ...state,
+        timeline: state.timeline.map((item) => item.status === 'running' ? { ...item, status: 'completed' } : item),
+        blocks: state.blocks.map((block) => {
+            if (block.type === 'command_group') {
+                return normalizeCommandGroup({
+                    ...block,
+                    commands: block.commands.map((item) => item.status === 'running' ? { ...item, status: 'completed' } : item),
+                    updatedAt: Date.now(),
+                });
+            }
+            if (block.type === 'tool_group') {
+                return normalizeToolGroup({
+                    ...block,
+                    items: block.items.map((item) => item.status === 'running' ? { ...item, status: 'completed' } : item),
+                    updatedAt: Date.now(),
+                });
+            }
+            return block;
+        }),
+    };
 }
 
 function upsertErrorBlock(state: StreamState, id: string, title: string, detail: string): StreamState {

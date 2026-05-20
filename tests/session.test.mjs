@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  bindSessionThreadRecord,
   buildSessionRecord,
   makeSessionKey,
   normalizeSessionMap,
@@ -75,4 +76,30 @@ test('builds session record without losing selected model', () => {
 
   assert.equal(second.model, 'gpt-5.4');
   assert.equal(second.reasoning_effort, 'high');
+});
+
+test('binds a selected desktop thread without losing session preferences', () => {
+  const previous = buildSessionRecord({
+    sessionKey: 'chat:open',
+    chatId: 'chat',
+    senderOpenId: 'open',
+    threadId: 'thread-1',
+    model: 'gpt-5.4',
+    reasoningEffort: 'high',
+    messageId: 'msg-1',
+    userText: '旧任务',
+  });
+
+  const next = bindSessionThreadRecord({
+    sessionKey: 'chat:open',
+    threadId: 'thread-desktop',
+    previous,
+    title: 'Desktop 线程',
+  });
+
+  assert.equal(next.codex_thread_id, 'thread-desktop');
+  assert.equal(next.model, 'gpt-5.4');
+  assert.equal(next.reasoning_effort, 'high');
+  assert.equal(next.first_message_id, 'msg-1');
+  assert.equal(next.title, 'Desktop 线程');
 });
