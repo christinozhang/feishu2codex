@@ -247,6 +247,67 @@ node scripts/print-bot-info.mjs
 
 完成权限变更后，创建并发布应用新版本。未发布的新权限不会对线上机器人生效。
 
+如果租户支持权限 JSON 导入，可以直接导入下面这份配置（你提供的版本）。
+
+```json
+{
+  "scopes": {
+    "tenant": [
+      "application:application.bot.operator_name:readonly",
+      "application:bot.basic_info:read",
+      "application:bot.menu:readonly",
+      "application:bot.menu:write",
+      "im:chat",
+      "im:chat.access_event.bot_p2p_chat:read",
+      "im:chat.announcement:read",
+      "im:chat.announcement:write_only",
+      "im:chat.chat_pins:read",
+      "im:chat.chat_pins:write_only",
+      "im:chat.collab_plugins:read",
+      "im:chat.collab_plugins:write_only",
+      "im:chat.managers:write_only",
+      "im:chat.members:bot_access",
+      "im:chat.members:read",
+      "im:chat.members:write_only",
+      "im:chat.menu_tree:read",
+      "im:chat.menu_tree:write_only",
+      "im:chat.moderation:read",
+      "im:chat.tabs:read",
+      "im:chat.tabs:write_only",
+      "im:chat.top_notice:write_only",
+      "im:chat.widgets:read",
+      "im:chat.widgets:write_only",
+      "im:chat:create",
+      "im:chat:delete",
+      "im:chat:moderation:write_only",
+      "im:chat:operate_as_owner",
+      "im:chat:read",
+      "im:chat:readonly",
+      "im:chat:update",
+      "im:message",
+      "im:message.group_at_msg.include_bot:readonly",
+      "im:message.group_at_msg:readonly",
+      "im:message.group_msg",
+      "im:message.p2p_msg:readonly",
+      "im:message.pins:read",
+      "im:message.pins:write_only",
+      "im:message.reactions:read",
+      "im:message.reactions:write_only",
+      "im:message.urgent.status:write",
+      "im:message:readonly",
+      "im:message:recall",
+      "im:message:send_as_bot",
+      "im:message:send_multi_depts",
+      "im:message:send_multi_users",
+      "im:message:send_sys_msg",
+      "im:message:update",
+      "im:resource"
+    ],
+    "user": []
+  }
+}
+```
+
 ### 配置事件订阅
 
 本项目使用飞书长连接，不需要公网 HTTP 回调地址。
@@ -255,12 +316,14 @@ node scripts/print-bot-info.mjs
 
 1. 进入 **事件与回调**。
 2. 将订阅方式设置为 **使用长连接接收事件**。
-3. 添加事件 `im.message.receive_v1`。
-4. 添加事件 `card.action.trigger`。
+3. 添加事件 `im.message.receive_v1`（必要）。
+4. 添加事件 `card.action.trigger`（必要，审批按钮回调）。
 5. 保存配置并发布应用版本。
 
 `im.message.receive_v1` 用于接收飞书消息。`card.action.trigger` 用于接收
 审批卡片上的 `Approve` 和 `Deny` 按钮点击。
+
+从当前代码实现看，以下事件不是必要项（已配置也不会被消费）：`im.chat.access_event.bot_p2p_chat_entered_v1`、`im.message.bot_muted_v1`、`im.message.message_read_v1`、`im.message.reaction.created_v1`、`im.message.reaction.deleted_v1`、`im.message.recalled_v1`。保留它们不会影响运行，但会增加事件噪声。
 
 ### 开启交互式卡片
 
