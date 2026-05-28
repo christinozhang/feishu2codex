@@ -215,6 +215,7 @@ node scripts/print-bot-info.mjs
 ## 飞书开放平台配置
 
 需要在飞书开放平台创建一个自建应用，并完成凭证、权限、事件和卡片配置。
+目标是让机器人通过飞书长连接收发消息，并支持交互卡片审批。
 
 ### 创建应用
 
@@ -268,6 +269,22 @@ node scripts/print-bot-info.mjs
 在飞书开放平台确认应用已启用机器人消息卡片或交互式卡片能力。启用后，发送
 一条需要审批的任务，卡片中应显示 `Approve` 和 `Deny` 按钮。点击按钮后，
 本地日志应出现 `received Feishu card action`。
+
+### 联调验收
+
+完成以上配置后，启动机器人并检查以下结果。
+
+- 启动日志出现 `ws client ready`。
+- 在会话中触发高风险任务时，卡片出现 `Approve` 和 `Deny` 按钮。
+- 点击按钮后日志出现 `received Feishu card action`。
+
+### 双机器人场景（可选）
+
+同时运行 Codex bot 和 Claude bot 时，需要两个独立飞书应用。
+
+- 使用两套不同的 `App ID` 和 `App Secret`。
+- 两边独立配置事件订阅与应用发布。
+- 两边独立配置会话文件与监听端口。
 
 ## 运行方式
 
