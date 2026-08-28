@@ -26,6 +26,7 @@ logs/
 # Runtime data
 bot_sessions.json
 bot_sessions.*.json
+bot_sessions*.bak*
 
 # Tool configuration
 .claude/

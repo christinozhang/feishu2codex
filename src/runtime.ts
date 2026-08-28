@@ -1,6 +1,10 @@
 import { Codex } from '@openai/codex-sdk';
 import { CodexAppServerRuntime } from './appServerRuntime.js';
 import { ClaudeCodeRuntime } from './claudeCodeRuntime.js';
+import { applyCodexResourceEnv, loadCodexResourceLimits, type CodexResourceLimits } from './resourceLimits.js';
+
+export { applyCodexResourceEnv, loadCodexResourceLimits };
+export type { CodexResourceLimits };
 
 export type CodexRuntimeKind = 'exec-sdk' | 'app-server' | 'claude-code';
 
@@ -70,11 +74,13 @@ export function createCodexRuntime(params: {
     kind: CodexRuntimeKind;
     env: Record<string, string | undefined>;
     codexPathOverride?: string;
+    resourceLimits?: CodexResourceLimits;
 }): CodexRuntime {
     if (params.kind === 'app-server') {
         return new CodexAppServerRuntime({
             codexBin: params.codexPathOverride,
             env: params.env,
+            resourceLimits: params.resourceLimits || loadCodexResourceLimits(params.env),
         });
     }
     if (params.kind === 'claude-code') {

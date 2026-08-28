@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { spawnSync } from 'child_process';
 import { getRunPolicy, requiresFeishuApproval } from './approval.js';
-import { buildRuntimePolicy, CodexRuntime, CodexRuntimeKind, CodexThreadHandle, createCodexRuntime, selectCodexRuntimeKind } from './runtime.js';
+import { applyCodexResourceEnv, buildRuntimePolicy, CodexRuntime, CodexRuntimeKind, CodexThreadHandle, createCodexRuntime, loadCodexResourceLimits, selectCodexRuntimeKind } from './runtime.js';
 import { bindSessionThreadRecord, buildSessionRecord, makeSessionKey, normalizeSessionMap, SessionRecord } from './session.js';
 import { startWebServer, updateStats, addLog } from './server.js';
 import {
@@ -33,6 +33,7 @@ import {
     SessionRunner,
     snapshotRunner,
 } from './queue.js';
+import { createTaskLimiter } from './taskLimiter.js';
 import {
     approvalSummaryText,
     formatModelStatus,
@@ -107,7 +108,8 @@ const client = new lark.Client({
     appSecret: process.env.FEISHU_APP_SECRET,
 });
 
-const codexEnv = { ...process.env };
+const codexResourceLimits = loadCodexResourceLimits(process.env);
+const codexEnv = applyCodexResourceEnv({ ...process.env }, codexResourceLimits);
 if (process.env.CODEX_CONFIG_DIR_OVERRIDE?.trim()) {
     codexEnv.CODEX_CONFIG_DIR = process.env.CODEX_CONFIG_DIR_OVERRIDE.trim();
 } else {
@@ -121,10 +123,13 @@ const codexRuntime: CodexRuntime = createCodexRuntime({
     kind: runtimeKind,
     env: codexEnv,
     codexPathOverride,
+    resourceLimits: codexResourceLimits,
 });
 console.log(`[Runtime] name=${runtimeDisplayName(codexRuntime.kind)} kind=${codexRuntime.kind}`);
+console.log(`[ResourceLimits] max_active_tasks=${codexResourceLimits.maxActiveTasks} task_timeout_ms=${codexResourceLimits.taskTimeoutMs} process_nice=${codexResourceLimits.processNice} cpu_time_seconds=${codexResourceLimits.cpuTimeSeconds} gomaxprocs=${codexResourceLimits.goMaxProcs} goflags=${codexResourceLimits.goFlags || '(empty)'} app_server_idle_shutdown_ms=${codexResourceLimits.appServerIdleShutdownMs}`);
 const threadMap = new Map<string, ThreadCache>();
 const sessionRunners = new Map<string, SessionRunner>();
+const codexTaskLimiter = createTaskLimiter(codexResourceLimits.maxActiveTasks);
 const pendingApprovals = new Map<string, ApprovalRequest>();
 const processedMessages = new Set<string>();
 const MAX_PROCESSED_MESSAGES = 1000;
@@ -506,10 +511,27 @@ async function drainSessionQueue(runner: SessionRunner) {
             runner.current = task;
             runner.abortController = new AbortController();
             runner.interrupted = false;
-            await runUserTaskNow(runner, task);
-            runner.current = null;
-            runner.abortController = null;
-            runner.interrupted = false;
+            let releaseTaskSlot: (() => void) | null = null;
+            let taskTimeout: NodeJS.Timeout | null = null;
+            try {
+                releaseTaskSlot = await codexTaskLimiter.acquire(runner.abortController.signal);
+                taskTimeout = armTaskTimeout(runner, task);
+                await runUserTaskNow(runner, task);
+            } catch (err) {
+                const message = err instanceof Error ? err.message : String(err);
+                if (runner.interrupted) {
+                    addLog('info', `任务已停止: ${task.id}`);
+                } else {
+                    console.error('执行队列任务出错:', err);
+                    addLog('error', `执行队列任务出错: ${message}`);
+                }
+            } finally {
+                if (taskTimeout) clearTimeout(taskTimeout);
+                releaseTaskSlot?.();
+                runner.current = null;
+                runner.abortController = null;
+                runner.interrupted = false;
+            }
         }
     } finally {
         runner.draining = false;
@@ -517,6 +539,18 @@ async function drainSessionQueue(runner: SessionRunner) {
             sessionRunners.delete(runner.sessionKey);
         }
     }
+}
+
+function armTaskTimeout(runner: SessionRunner, task: QueuedTask): NodeJS.Timeout | null {
+    if (codexResourceLimits.taskTimeoutMs <= 0) return null;
+    return setTimeout(() => {
+        if (!runner.current || runner.current.id !== task.id) return;
+        runner.interrupted = true;
+        runner.abortController?.abort();
+        const seconds = Math.round(codexResourceLimits.taskTimeoutMs / 1000);
+        console.warn(`[ResourceLimits] task timeout after ${seconds}s: ${task.id}`);
+        addLog('warn', `任务超过 ${seconds}s，已请求停止 Codex: ${task.id}`);
+    }, codexResourceLimits.taskTimeoutMs);
 }
 
 async function runUserTaskNow(runner: SessionRunner, task: QueuedTask) {
@@ -727,7 +761,6 @@ async function runCodexStreamToFeishu(params: {
     isInterrupted: () => boolean;
 }) {
     const policy = getRunPolicy(params.privileged);
-    const thread = await getOrCreateThread(params.sessionKey, policy, params.userText);
     let state = createStreamState(params.userText, 'running', runtimeDisplayName(codexRuntime.kind));
     const cardOptions = runtimeCardOptions(params);
     const targetMessageId = params.targetMessageId || await replyInteractive(params.sourceMessageId, state, cardOptions);
@@ -739,6 +772,7 @@ async function runCodexStreamToFeishu(params: {
     let lastUpdateAt = Date.now();
 
     try {
+        const thread = await getOrCreateThread(params.sessionKey, policy, params.userText);
         console.log(`[Runtime] requesting ${runtimeDisplayName(codexRuntime.kind)} kind=${codexRuntime.kind}`);
         const { events } = await thread.runStreamed(params.userText, { signal: params.signal });
 
@@ -768,6 +802,18 @@ async function runCodexStreamToFeishu(params: {
             addLog('info', `任务已被打断: ${params.id}`);
         } else {
             const message = err instanceof Error ? err.message : String(err);
+            const isThreadError = message.includes('thread not found') || message.includes('JSON-RPC client closed');
+            const isRetryable = isThreadError && !(params as any).__retried;
+            if (isRetryable) {
+                console.warn(`[会话 ${params.sessionKey}] 线程/app-server 失效，清理状态并重试: ${message}`);
+                if (sessionMap[params.sessionKey]) {
+                    delete sessionMap[params.sessionKey].codex_thread_id;
+                }
+                threadMap.delete(params.sessionKey);
+                (params as any).__retried = true;
+                await runCodexStreamToFeishu(params);
+                return;
+            }
             state = updateStreamState(state, { type: 'error', message });
             console.error(`${runtimeDisplayName(codexRuntime.kind)} 流式处理出错:`, err);
             addLog('error', `${runtimeDisplayName(codexRuntime.kind)} 流式处理出错: ${message}`);

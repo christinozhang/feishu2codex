@@ -4,13 +4,16 @@ import test from 'node:test';
 import {
   AppServerJsonRpcClient,
   CodexAppServerRuntime,
+  buildCodexAppServerSpawn,
   mapAppServerNotification,
 } from '../dist/appServerRuntime.js';
 import {
   createClaudeCodeEventMapper,
 } from '../dist/claudeCodeRuntime.js';
 import {
+  applyCodexResourceEnv,
   buildRuntimePolicy,
+  loadCodexResourceLimits,
   selectCodexRuntimeKind,
 } from '../dist/runtime.js';
 
@@ -54,6 +57,86 @@ test('builds shared runtime policy from environment and task policy', () => {
   assert.equal(policy.workingDirectory, '/tmp/project');
   assert.equal(policy.desktopListDirectory, '/tmp/sidebar');
   assert.equal(policy.sandboxMode, 'workspace-write');
+});
+
+test('loads resource limits with protective defaults and env overrides', () => {
+  const defaults = loadCodexResourceLimits({}, 'darwin');
+  assert.equal(defaults.maxActiveTasks, 1);
+  assert.equal(defaults.taskTimeoutMs, 20 * 60 * 1000);
+  assert.equal(defaults.processNice, 10);
+  assert.equal(defaults.goMaxProcs, 2);
+  assert.equal(defaults.goFlags, '-p=1');
+  assert.equal(defaults.goMemoryLimit, '');
+  assert.equal(defaults.appServerIdleShutdownMs, 60 * 1000);
+  assert.equal(defaults.interruptKillGraceMs, 5000);
+  assert.equal(defaults.processGroupKill, true);
+
+  const custom = loadCodexResourceLimits({
+    CODEX_MAX_ACTIVE_TASKS: '2',
+    CODEX_TASK_TIMEOUT_MS: '30000',
+    CODEX_PROCESS_NICE: '5',
+    CODEX_CPU_TIME_SECONDS: '600',
+    CODEX_CHILD_GOMAXPROCS: '4',
+    CODEX_CHILD_GOFLAGS: '-p=2 -vet=off',
+    CODEX_CHILD_GOMEMLIMIT: '3GiB',
+    CODEX_APP_SERVER_IDLE_SHUTDOWN_MS: '10000',
+    CODEX_INTERRUPT_KILL_GRACE_MS: '1000',
+    CODEX_PROCESS_GROUP_KILL: 'false',
+  }, 'darwin');
+  assert.equal(custom.maxActiveTasks, 2);
+  assert.equal(custom.taskTimeoutMs, 30000);
+  assert.equal(custom.processNice, 5);
+  assert.equal(custom.cpuTimeSeconds, 600);
+  assert.equal(custom.goMaxProcs, 4);
+  assert.equal(custom.goFlags, '-p=2 -vet=off');
+  assert.equal(custom.goMemoryLimit, '3GiB');
+  assert.equal(custom.appServerIdleShutdownMs, 10000);
+  assert.equal(custom.interruptKillGraceMs, 1000);
+  assert.equal(custom.processGroupKill, false);
+});
+
+test('applies Go resource limits to Codex child environment', () => {
+  const env = applyCodexResourceEnv({
+    PATH: '/usr/bin',
+    GOMAXPROCS: '8',
+  }, {
+    maxActiveTasks: 1,
+    taskTimeoutMs: 1000,
+    processNice: 10,
+    cpuTimeSeconds: 0,
+    goMaxProcs: 2,
+    goFlags: '-p=1',
+    goMemoryLimit: '3GiB',
+    appServerIdleShutdownMs: 1000,
+    interruptKillGraceMs: 5000,
+    processGroupKill: true,
+  });
+
+  assert.equal(env.GOMAXPROCS, '2');
+  assert.equal(env.GOFLAGS, '-p=1');
+  assert.equal(env.GOMEMLIMIT, '3GiB');
+  assert.equal(env.PATH, '/usr/bin');
+});
+
+test('builds app-server spawn command with unix resource wrapper', () => {
+  const spawn = buildCodexAppServerSpawn('/usr/local/bin/codex', {
+    maxActiveTasks: 1,
+    taskTimeoutMs: 1000,
+    processNice: 10,
+    cpuTimeSeconds: 60,
+    goMaxProcs: 2,
+    goFlags: '-p=1',
+    goMemoryLimit: '',
+    appServerIdleShutdownMs: 1000,
+    interruptKillGraceMs: 5000,
+    processGroupKill: true,
+  }, 'darwin');
+
+  assert.equal(spawn.command, '/bin/bash');
+  assert.deepEqual(spawn.args.slice(2), ['/usr/local/bin/codex', 'app-server', '--listen', 'stdio://']);
+  assert.match(spawn.args[1], /ulimit -t 60/);
+  assert.match(spawn.args[1], /nice -n 10/);
+  assert.equal(spawn.detached, true);
 });
 
 test('JSON-RPC client writes newline-delimited requests and resolves matching response', async () => {

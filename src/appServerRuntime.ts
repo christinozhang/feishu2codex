@@ -2,6 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
 import { EventEmitter } from 'events';
 import readline from 'readline';
 import type { CodexRuntime, CodexThreadHandle, CodexThreadSummary, RuntimePolicy } from './runtime.js';
+import { loadCodexResourceLimits, type CodexResourceLimits } from './resourceLimits.js';
 
 type JsonRpcIo = {
     stdin: NodeJS.WritableStream;
@@ -116,13 +117,22 @@ export class CodexAppServerRuntime implements CodexRuntime {
     readonly kind = 'app-server' as const;
     private readonly codexBin: string;
     private readonly env: Record<string, string | undefined>;
+    private readonly resourceLimits: CodexResourceLimits;
     private child: ChildProcessWithoutNullStreams | null = null;
     private client: AppServerJsonRpcClient | null = null;
     private initializePromise: Promise<AppServerJsonRpcClient> | null = null;
+    private idleShutdownTimer: NodeJS.Timeout | null = null;
+    private activeTurns = 0;
 
-    constructor(params: { codexBin?: string; env: Record<string, string | undefined>; client?: AppServerJsonRpcClient }) {
+    constructor(params: {
+        codexBin?: string;
+        env: Record<string, string | undefined>;
+        client?: AppServerJsonRpcClient;
+        resourceLimits?: CodexResourceLimits;
+    }) {
         this.codexBin = params.codexBin || 'codex';
         this.env = params.env;
+        this.resourceLimits = params.resourceLimits || loadCodexResourceLimits(params.env);
         if (params.client) {
             this.client = params.client;
             this.initializePromise = Promise.resolve(params.client);
@@ -171,6 +181,7 @@ export class CodexAppServerRuntime implements CodexRuntime {
         const queue = createAsyncQueue<any>();
         let turnId: string | null = null;
         let removed = false;
+        this.activeTurns += 1;
 
         const removeListener = client.onNotification((notification) => {
             const params = notification.params || {};
@@ -188,8 +199,9 @@ export class CodexAppServerRuntime implements CodexRuntime {
         });
 
         const abort = () => {
-            if (!turnId) return;
-            client.request('turn/interrupt', { threadId, turnId }).catch(() => {});
+            if (turnId) client.request('turn/interrupt', { threadId, turnId }).catch(() => {});
+            this.scheduleAppServerStop();
+            queue.end();
         };
         signal?.addEventListener('abort', abort, { once: true });
 
@@ -213,48 +225,133 @@ export class CodexAppServerRuntime implements CodexRuntime {
                 removeListener();
             }
             signal?.removeEventListener('abort', abort);
+            this.activeTurns = Math.max(0, this.activeTurns - 1);
+            this.scheduleIdleShutdown();
         }
     }
 
     private async ensureClient() {
+        this.clearIdleShutdown();
         if (this.initializePromise) return this.initializePromise;
         this.initializePromise = this.startAppServer();
         return this.initializePromise;
     }
 
     private async startAppServer() {
-        this.child = spawn(this.codexBin, ['app-server', '--listen', 'stdio://'], {
+        const spawnConfig = buildCodexAppServerSpawn(this.codexBin, this.resourceLimits);
+        const child = spawn(spawnConfig.command, spawnConfig.args, {
             env: this.env as NodeJS.ProcessEnv,
             stdio: ['pipe', 'pipe', 'pipe'],
+            detached: spawnConfig.detached,
         });
-        this.child.on('exit', () => {
-            this.client?.close();
-            this.client = null;
-            this.child = null;
-            this.initializePromise = null;
+        this.child = child;
+        const client = new AppServerJsonRpcClient({
+            stdin: child.stdin,
+            stdout: child.stdout,
+            stderr: child.stderr,
         });
-        this.client = new AppServerJsonRpcClient({
-            stdin: this.child.stdin,
-            stdout: this.child.stdout,
-            stderr: this.child.stderr,
-        });
-        this.child.stderr.on('data', (chunk) => {
+        this.client = client;
+        const cleanup = () => {
+            client.close();
+            if (this.client === client) this.client = null;
+            if (this.child === child) this.child = null;
+            if (this.initializePromise === initPromise) this.initializePromise = null;
+        };
+        child.on('exit', cleanup);
+        child.stderr.on('data', (chunk) => {
             const text = String(chunk).trim();
             if (text) console.warn(`[app-server] ${text}`);
         });
-        await this.client.request('initialize', {
-            clientInfo: {
-                name: 'feishu2codex',
-                title: 'Feishu Codex Bot',
-                version: '1.0.0',
-            },
-            capabilities: {
-                experimentalApi: true,
-            },
-        });
-        this.client.sendNotification('initialized');
-        return this.client;
+        const initPromise = (async () => {
+            await client.request('initialize', {
+                clientInfo: {
+                    name: 'feishu2codex',
+                    title: 'Feishu Codex Bot',
+                    version: '1.0.0',
+                },
+                capabilities: {
+                    experimentalApi: true,
+                },
+            });
+            client.sendNotification('initialized');
+            return client;
+        })();
+        this.initializePromise = initPromise;
+        return initPromise;
     }
+
+    private scheduleAppServerStop() {
+        const child = this.child;
+        if (!child?.pid) return;
+        setTimeout(() => terminateChildProcess(child, this.resourceLimits), this.resourceLimits.interruptKillGraceMs);
+    }
+
+    private scheduleIdleShutdown() {
+        if (this.resourceLimits.appServerIdleShutdownMs <= 0 || this.activeTurns > 0) return;
+        this.clearIdleShutdown();
+        const child = this.child;
+        if (!child?.pid) return;
+        this.idleShutdownTimer = setTimeout(() => {
+            if (this.activeTurns > 0) return;
+            terminateChildProcess(child, this.resourceLimits);
+        }, this.resourceLimits.appServerIdleShutdownMs);
+    }
+
+    private clearIdleShutdown() {
+        if (!this.idleShutdownTimer) return;
+        clearTimeout(this.idleShutdownTimer);
+        this.idleShutdownTimer = null;
+    }
+}
+
+export type AppServerSpawnConfig = {
+    command: string;
+    args: string[];
+    detached: boolean;
+};
+
+export function buildCodexAppServerSpawn(
+    codexBin: string,
+    limits: CodexResourceLimits,
+    platform = process.platform,
+): AppServerSpawnConfig {
+    const appServerArgs = ['app-server', '--listen', 'stdio://'];
+    if (platform === 'win32' || (limits.processNice === 0 && limits.cpuTimeSeconds === 0)) {
+        return {
+            command: codexBin,
+            args: appServerArgs,
+            detached: platform !== 'win32' && limits.processGroupKill,
+        };
+    }
+
+    const script = [
+        limits.cpuTimeSeconds > 0 ? `ulimit -t ${limits.cpuTimeSeconds}` : '',
+        limits.processNice > 0 ? `exec nice -n ${limits.processNice} "$0" "$@"` : 'exec "$0" "$@"',
+    ].filter(Boolean).join('\n');
+
+    return {
+        command: '/bin/bash',
+        args: ['-lc', script, codexBin, ...appServerArgs],
+        detached: limits.processGroupKill,
+    };
+}
+
+function terminateChildProcess(child: ChildProcessWithoutNullStreams, limits: CodexResourceLimits) {
+    if (!child.pid || child.exitCode !== null) return;
+    const targetPid = process.platform !== 'win32' && limits.processGroupKill ? -child.pid : child.pid;
+    try {
+        process.kill(targetPid, 'SIGTERM');
+    } catch {
+        return;
+    }
+    setTimeout(() => {
+        if (child.exitCode !== null) return;
+        try {
+            process.kill(targetPid, 'SIGKILL');
+        } catch {
+            // Process already exited.
+        }
+    }, Math.max(1000, limits.interruptKillGraceMs));
 }
 
 function threadSummaryFromAppServer(thread: any): CodexThreadSummary {

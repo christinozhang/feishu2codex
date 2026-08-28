@@ -127,6 +127,17 @@ CODEX_SKIP_GIT_CHECK=true
 CODEX_REASONING_EFFORT=medium
 CODEX_WEB_SEARCH_ENABLED=true
 
+CODEX_MAX_ACTIVE_TASKS=1
+CODEX_TASK_TIMEOUT_MS=1200000
+CODEX_PROCESS_NICE=10
+CODEX_CPU_TIME_SECONDS=0
+CODEX_CHILD_GOMAXPROCS=2
+CODEX_CHILD_GOFLAGS=-p=1
+CODEX_CHILD_GOMEMLIMIT=
+CODEX_APP_SERVER_IDLE_SHUTDOWN_MS=60000
+CODEX_INTERRUPT_KILL_GRACE_MS=5000
+CODEX_PROCESS_GROUP_KILL=true
+
 WEB_PORT=3000
 ```
 
@@ -148,6 +159,19 @@ WEB_PORT=3000
 - `CODEX_WORKING_DIRECTORY`：Codex 执行任务时使用的工作目录。
 - `CODEX_DESKTOP_LIST_DIRECTORY`：仅用于 Codex Desktop 侧边栏分组和
   `/threads` 检索范围。留空时使用 `CODEX_WORKING_DIRECTORY`。
+- `CODEX_MAX_ACTIVE_TASKS`：同一 bot 进程内可同时执行的 agent 任务数。
+- `CODEX_TASK_TIMEOUT_MS`：单个任务的超时时间，单位为毫秒；设置为 `0` 表示
+  不启用任务超时。
+- `CODEX_PROCESS_NICE` 和 `CODEX_CPU_TIME_SECONDS`：`app-server` runtime
+  启动 Codex 子进程时使用的本机进程限制。
+- `CODEX_CHILD_GOMAXPROCS`、`CODEX_CHILD_GOFLAGS` 和
+  `CODEX_CHILD_GOMEMLIMIT`：传给 agent 子进程的 Go 运行参数。
+- `CODEX_APP_SERVER_IDLE_SHUTDOWN_MS`：`app-server` runtime 空闲后停止 Codex
+  子进程的等待时间，单位为毫秒。
+- `CODEX_INTERRUPT_KILL_GRACE_MS`：任务中断后等待子进程退出的时间，单位为
+  毫秒。
+- `CODEX_PROCESS_GROUP_KILL`：是否按进程组停止 `app-server` 子进程，默认
+  `true`。
 - `WEB_PORT`：本地状态服务端口，默认是 `3000`。
 
 ### Codex 与 Claude Code 独立配置
@@ -189,6 +213,10 @@ WEB_PORT=3001
 `$HOME/.local/bin/claude-deepseek-v4` 只是示例路径；如果包装命令在其他目录，
 需要改成对应路径或命令名。`CODEX_WORKING_DIRECTORY` 也需要按希望 Claude
 Code 执行任务的目录配置。
+
+Claude bot 也会读取上面的任务资源限制变量。`CODEX_MAX_ACTIVE_TASKS` 和
+`CODEX_TASK_TIMEOUT_MS` 对 `claude-code` runtime 生效；`app-server` 子进程
+相关变量只影响 Codex bot 的 `app-server` runtime。
 
 `claude-code` runtime 会执行 `CLAUDE_CODE_BIN`，并使用 Claude Code 的
 `--print --verbose --output-format stream-json --include-partial-messages`
@@ -561,13 +589,15 @@ npm run build
 - `src/runtime.ts`：Codex SDK、Codex app-server 和 Claude Code runtime 选择。
 - `src/appServerRuntime.ts`：Codex app-server JSON-RPC 适配。
 - `src/claudeCodeRuntime.ts`：Claude Code `stream-json` 适配。
+- `src/resourceLimits.ts`：任务并发、超时和子进程资源限制配置。
+- `src/taskLimiter.ts`：bot 进程内的任务并发限制。
 - `src/streaming.ts`：runtime 事件模型、卡片渲染、Markdown 处理和脱敏。
 - `src/session.ts`：会话文件兼容和更新。
 - `src/queue.ts`：同一飞书会话内的当前任务、等待队列、取消和打断插队。
 - `src/approval.ts`：风险关键词和 Codex 运行策略。
 - `src/slash.ts`：slash 命令解析和本地命令。
 - `src/server.ts`：本地状态接口。
-- `tests/*.test.mjs`：审批、会话、slash 和卡片回归测试。
+- `tests/*.test.mjs`：审批、会话、slash、任务限制和卡片回归测试。
 
 ## 常见问题
 
