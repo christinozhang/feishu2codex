@@ -231,7 +231,7 @@ export function buildQueuedTaskCard(params: {
 }) {
     const task = params.task;
     return buildCard(
-        { template: 'blue', title: { tag: 'plain_text', content: 'Codex 已加入队列' } },
+        { template: 'blue', title: { tag: 'plain_text', content: 'Agent 已加入队列' } },
         [
             {
                 tag: 'markdown',
@@ -271,7 +271,7 @@ export function buildQueueSummaryCard(params: {
         : '无等待任务';
 
     return buildCard(
-        { template: 'blue', title: { tag: 'plain_text', content: 'Codex 队列' } },
+        { template: 'blue', title: { tag: 'plain_text', content: 'Agent 队列' } },
         [
             {
                 tag: 'markdown',

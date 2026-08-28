@@ -48,6 +48,18 @@ export function selectCodexRuntimeKind(env: Record<string, string | undefined> =
     return 'exec-sdk';
 }
 
+export function runtimeDisplayNameForKind(
+    kind: CodexRuntimeKind,
+    env: Record<string, string | undefined> = process.env,
+    sessionModel?: string,
+) {
+    if (kind !== 'claude-code') return 'Codex';
+    const configured = env.CLAUDE_CODE_DISPLAY_NAME?.trim();
+    if (configured) return configured;
+    const model = env.CLAUDE_CODE_MODEL?.trim() || sessionModel || env.CODEX_MODEL?.trim();
+    return model ? `ClaudeCode/${model}` : 'ClaudeCode';
+}
+
 export function buildRuntimePolicy(params: {
     env?: Record<string, string | undefined>;
     workingDirectory: string;
@@ -68,6 +80,46 @@ export function buildRuntimePolicy(params: {
         skipGitRepoCheck: env.CODEX_SKIP_GIT_CHECK?.toLowerCase() !== 'false',
         webSearchEnabled: env.CODEX_WEB_SEARCH_ENABLED?.toLowerCase() !== 'false',
     };
+}
+
+export type RuntimeRetryParams = {
+    targetMessageId: string | null;
+    retried?: boolean;
+};
+
+export function isRetryableThreadError(message: string, retried = false) {
+    if (retried) return false;
+    return (
+        message.includes('thread not found') ||
+        message.includes('JSON-RPC client closed') ||
+        message.includes('JSON-RPC client is closed')
+    );
+}
+
+export function isRuntimeConnectionClosedEvent(event: any) {
+    if (!event || typeof event !== 'object') return false;
+    if (event.type !== 'turn.failed' && event.type !== 'error') return false;
+    const message = event.error?.message || event.message;
+    return typeof message === 'string' && isRetryableThreadError(message, false);
+}
+
+export function buildRuntimeRetryParams<T extends RuntimeRetryParams>(
+    params: T,
+    targetMessageId: string | null,
+): T & { retried: true; targetMessageId: string | null } {
+    return {
+        ...params,
+        targetMessageId,
+        retried: true,
+    };
+}
+
+export function shouldFlushFinalStreamState(
+    state: unknown,
+    lastState: unknown,
+    delegatedRetry = false,
+) {
+    return !delegatedRetry && JSON.stringify(state) !== JSON.stringify(lastState);
 }
 
 export function createCodexRuntime(params: {

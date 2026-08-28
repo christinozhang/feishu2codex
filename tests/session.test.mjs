@@ -3,8 +3,10 @@ import test from 'node:test';
 import {
   bindSessionThreadRecord,
   buildSessionRecord,
+  clearRuntimeSessionId,
   makeSessionKey,
   normalizeSessionMap,
+  runtimeSessionIdField,
 } from '../dist/session.js';
 
 test('session key includes chat and sender', () => {
@@ -112,6 +114,34 @@ test('builds Claude session record without changing Codex thread id', () => {
 
   assert.equal(next.codex_thread_id, 'codex-thread-1');
   assert.equal(next.claude_session_id, 'claude-session-1');
+});
+
+test('selects the session id field for each runtime kind', () => {
+  assert.equal(runtimeSessionIdField('exec-sdk'), 'codex_thread_id');
+  assert.equal(runtimeSessionIdField('app-server'), 'codex_thread_id');
+  assert.equal(runtimeSessionIdField('claude-code'), 'claude_session_id');
+});
+
+test('clears only the current runtime session identity', () => {
+  const previous = {
+    session_key: 'chat:open',
+    chat_id: 'chat',
+    sender_open_id: 'open',
+    codex_thread_id: 'codex-thread-1',
+    claude_session_id: 'claude-session-1',
+    model: 'gpt-5.4',
+    updated_at: '2026-08-28T00:00:00.000Z',
+  };
+
+  const codexCleared = clearRuntimeSessionId(previous, 'app-server');
+  assert.equal(codexCleared.codex_thread_id, undefined);
+  assert.equal(codexCleared.claude_session_id, 'claude-session-1');
+  assert.equal(codexCleared.model, 'gpt-5.4');
+  assert.equal(previous.codex_thread_id, 'codex-thread-1');
+
+  const claudeCleared = clearRuntimeSessionId(previous, 'claude-code');
+  assert.equal(claudeCleared.codex_thread_id, 'codex-thread-1');
+  assert.equal(claudeCleared.claude_session_id, undefined);
 });
 
 test('binds a selected desktop thread without losing session preferences', () => {

@@ -3,9 +3,9 @@
 `feishu2codex` 是一个 TypeScript 飞书机器人。它通过飞书长连接接收
 消息，把本机 Codex 或 Claude Code 的流式事件渲染成飞书交互卡片。
 
-仓库支持两个互相独立的机器人进程：一个连接 Codex，一个连接 Claude
-Code/DeepSeek。两个进程必须使用不同的飞书 App ID 和 App Secret，也必须使用
-不同的会话文件和端口。
+仓库支持两个互相独立的机器人进程：一个连接 Codex，一个连接 Claude Code。
+两个进程必须使用不同的飞书 App ID 和 App Secret，也必须使用不同的会话文件
+和端口。
 
 项目适合需要把本机 AI coding agent 接入飞书会话的场景。机器人支持会话记忆、
 交互卡片、风险审批、执行过程折叠面板、Markdown 回复区，以及本地 slash
@@ -23,7 +23,7 @@ Code/DeepSeek。两个进程必须使用不同的飞书 App ID 和 App Secret，
 
 - 飞书长连接接收消息，不要求公网回调地址。
 - Codex SDK 线程持久化，同一个飞书会话可以延续上下文。
-- Claude Code runtime 可以通过 `claude-deepseek-v4` 使用 DeepSeek 模型。
+- Claude Code runtime 可以把 Claude Code `stream-json` 输出映射成飞书卡片。
 - Codex 和 Claude Code 使用不同飞书应用、不同 env 文件、不同 session 文件。
 - 飞书交互卡片展示任务、回复和执行过程。
 - 同一飞书会话支持当前任务、等待队列、取消排队和打断插队。
@@ -31,15 +31,16 @@ Code/DeepSeek。两个进程必须使用不同的飞书 App ID 和 App Secret，
 - 普通问答和只读任务默认直接执行。
 - slash 命令支持 `/help`、`/skills`、`/skill`、`/mcp`、
   `/approval`、`/queue`、`/threads`、`/interrupt`、`/cancel`、
-  `/clear-queue`、`/model`、`/reset` 和 `/status`。
+  `/clear-queue`、`/model`、`/reset` 和 `/status`；其中 `/threads` 当前仅适用
+  `CODEX_RUNTIME=app-server`，`/mcp` 当前查询 Codex CLI。
 - 可选使用 Codex `app-server` runtime，让新建对话更容易出现在
   Codex Desktop 侧边栏中。
 - 可选使用 `claude-code` runtime，把 Claude Code `stream-json` 输出映射成同一套
   飞书卡片。
 - `/threads [keyword]` 可以检索 Codex Desktop 对话，并把选中的 thread 绑定到
   当前飞书会话。
-- `/model [model_name] [reasoning_effort]` 可以查看或设置当前飞书会话使用的
-  Codex 模型配置。
+- `/model [model_name] [reasoning_effort]` 可以查看或设置当前飞书会话模型；
+  在 `claude-code` runtime 下会转换成 Claude Code `--model` 参数。
 - 回复区使用飞书 Card JSON 2.0，支持代码块、行内代码标签和原生表格组件。
 - 本地 Web 状态接口展示运行状态和日志。
 
@@ -50,9 +51,9 @@ Code/DeepSeek。两个进程必须使用不同的飞书 App ID 和 App Secret，
 - Node.js 18 或更新版本。
 - Bun，用于构建 TypeScript 入口。
 - 一个飞书自建应用。
-- 已登录并可用的 Codex CLI 或 Codex.app 命令行入口。
-- 可选：已登录并可用的 Claude Code CLI。
-- 可选：可执行的 Claude Code 包装命令，例如 `claude-deepseek-v4`。
+- Codex bot 需要已登录并可用的 Codex CLI 或 Codex.app 命令行入口。
+- Claude bot 需要已登录并可用的 Claude Code CLI，或可执行的 Claude Code
+  包装命令。
 - 可选：本机已有 Codex MCP、skills 或其他 agent 资产。
 
 安装 Bun 的方式由运行环境决定。macOS 可以使用 Homebrew 或官方安装脚本。
@@ -124,8 +125,15 @@ CODEX_WORKING_DIRECTORY=./workspace
 CODEX_RUNTIME=exec-sdk
 CODEX_DESKTOP_LIST_DIRECTORY=
 CODEX_SKIP_GIT_CHECK=true
+CODEX_MODEL=
 CODEX_REASONING_EFFORT=medium
 CODEX_WEB_SEARCH_ENABLED=true
+
+CLAUDE_CODE_BIN=
+CLAUDE_CODE_PERMISSION_MODE=
+CLAUDE_CODE_MODEL=
+CLAUDE_CODE_EXTRA_ARGS=
+CLAUDE_CODE_DISPLAY_NAME=
 
 CODEX_MAX_ACTIVE_TASKS=1
 CODEX_TASK_TIMEOUT_MS=1200000
@@ -154,11 +162,17 @@ WEB_PORT=3000
 - `CODEX_RUNTIME`：Codex 运行后端。默认 `exec-sdk` 使用
   `@openai/codex-sdk` 和 `codex exec`；设置为 `app-server` 时使用
   `codex app-server`，新建对话更容易被 Codex Desktop 索引。
+- `CLAUDE_CODE_BIN`、`CLAUDE_CODE_PERMISSION_MODE`、`CLAUDE_CODE_MODEL`、
+  `CLAUDE_CODE_EXTRA_ARGS` 和 `CLAUDE_CODE_DISPLAY_NAME`：仅在
+  `CODEX_RUNTIME=claude-code` 时使用，控制 Claude Code 入口、权限模式、
+  模型、额外参数和卡片标题。
 - `CODEX_PATH_OVERRIDE`：Codex 可执行文件路径。macOS 中如果 SDK 自带
   二进制被系统拦截，可以填写 Codex.app 内的已签名命令行入口。
 - `CODEX_WORKING_DIRECTORY`：Codex 执行任务时使用的工作目录。
 - `CODEX_DESKTOP_LIST_DIRECTORY`：仅用于 Codex Desktop 侧边栏分组和
   `/threads` 检索范围。留空时使用 `CODEX_WORKING_DIRECTORY`。
+- `CODEX_MODEL`：默认模型。飞书会话通过 `/model` 设置模型后，会话值优先于
+  `CODEX_MODEL`。
 - `CODEX_MAX_ACTIVE_TASKS`：同一 bot 进程内可同时执行的 agent 任务数。
 - `CODEX_TASK_TIMEOUT_MS`：单个任务的超时时间，单位为毫秒；设置为 `0` 表示
   不启用任务超时。
@@ -174,10 +188,11 @@ WEB_PORT=3000
   `true`。
 - `WEB_PORT`：本地状态服务端口，默认是 `3000`。
 
-### Codex 与 Claude Code 独立配置
+### Claude Code 只连接飞书的配置
 
-同一份代码可以启动两个不同的飞书机器人进程。两个进程共享构建产物，但必须
-隔离飞书应用、会话文件和端口。
+同一份代码可以启动两个不同的飞书机器人进程。Claude bot 可以单独运行；它
+不要求 Codex 登录，也不会启动 Codex SDK 或 `codex app-server`。两个进程同时
+运行时必须隔离飞书应用、会话文件和端口。
 
 | 进程 | Env 文件 | 飞书应用 | Runtime | Session 文件 | Web 端口 |
 | --- | --- | --- | --- | --- | --- |
@@ -202,26 +217,39 @@ FEISHU_APPROVAL_BUTTONS_ENABLED=true
 FEISHU_APPROVAL_TIMEOUT_MS=60000
 
 CODEX_RUNTIME=claude-code
-CLAUDE_CODE_BIN=$HOME/.local/bin/claude-deepseek-v4
+CLAUDE_CODE_BIN=claude
 CLAUDE_CODE_PERMISSION_MODE=acceptEdits
+CLAUDE_CODE_MODEL=
+CLAUDE_CODE_EXTRA_ARGS=
 BOT_SESSION_FILE=bot_sessions.claude.json
 CODEX_WORKING_DIRECTORY=$HOME
 WEB_PORT=3001
 ```
 
-`CLAUDE_CODE_BIN` 需要按本机实际安装位置配置。上面的
-`$HOME/.local/bin/claude-deepseek-v4` 只是示例路径；如果包装命令在其他目录，
-需要改成对应路径或命令名。`CODEX_WORKING_DIRECTORY` 也需要按希望 Claude
-Code 执行任务的目录配置。
+`CLAUDE_CODE_BIN=claude` 要求 `claude` 在当前进程的 `PATH` 中可执行。如果
+使用包装命令或绝对路径，把 `CLAUDE_CODE_BIN` 改成对应命令。`CODEX_*` 变量名
+是历史通用配置名；在 `CODEX_RUNTIME=claude-code` 时，机器人会把这些值转换成
+Claude Code 的运行参数和子进程环境。
+
+`CLAUDE_CODE_PERMISSION_MODE` 有值时直接传给 `--permission-mode`。未设置时，
+机器人根据任务策略换算：`approvalPolicy=never` 且
+`sandboxMode=danger-full-access` 时使用 `bypassPermissions`；
+`approvalPolicy=never` 且其他 sandbox 时使用 `acceptEdits`；其他情况使用
+`default`。`--model` 的来源优先级是 `CLAUDE_CODE_MODEL`、飞书会话 `/model`、
+`CODEX_MODEL`；三者都为空时不传 `--model`。`CLAUDE_CODE_EXTRA_ARGS` 会按空白
+分隔加入 Claude Code 参数列表。
 
 Claude bot 也会读取上面的任务资源限制变量。`CODEX_MAX_ACTIVE_TASKS` 和
-`CODEX_TASK_TIMEOUT_MS` 对 `claude-code` runtime 生效；`app-server` 子进程
-相关变量只影响 Codex bot 的 `app-server` runtime。
+`CODEX_TASK_TIMEOUT_MS` 对 `claude-code` runtime 生效。`CODEX_CHILD_GOMAXPROCS`、
+`CODEX_CHILD_GOFLAGS` 和 `CODEX_CHILD_GOMEMLIMIT` 会转换成 Claude 子进程环境中的
+`GOMAXPROCS`、`GOFLAGS` 和 `GOMEMLIMIT`。`CODEX_PROCESS_NICE`、
+`CODEX_CPU_TIME_SECONDS`、`CODEX_APP_SERVER_IDLE_SHUTDOWN_MS`、
+`CODEX_INTERRUPT_KILL_GRACE_MS` 和 `CODEX_PROCESS_GROUP_KILL` 只影响 Codex
+`app-server` runtime。
 
-`claude-code` runtime 会执行 `CLAUDE_CODE_BIN`，并使用 Claude Code 的
-`--print --verbose --output-format stream-json --include-partial-messages`
-输出模式。`claude-deepseek-v4` 负责把 Claude Code 请求转到 DeepSeek 的
-Anthropic 兼容接口。
+`claude-code` runtime 会执行 `CLAUDE_CODE_BIN`，并固定传入 `--print`、
+`--verbose`、`--output-format stream-json`、`--include-partial-messages` 和
+`--permission-mode <mode>`。
 
 会话字段也互相独立。
 
@@ -454,31 +482,31 @@ launchctl enable gui/$(id -u)/ai.feishu-claude-bot
 
 - `/help`：查看命令说明。
 - `/skills [keyword]`：列出本机可用 skills。
-- `/skill <name> <task>`：用指定 skill 改写任务并交给 Codex。
-- `/mcp`：查看当前 Codex CLI 可见 MCP。
+- `/skill <name> <task>`：用指定 skill 改写任务并交给当前 runtime。
+- `/mcp`：当前查看 Codex CLI 可见 MCP；Claude Code MCP 查询尚未实现。
 - `/approval`：查看审批策略。
 - `/queue`：查看当前任务和等待队列。
-- `/threads [keyword]`：检索 Codex Desktop 对话，并用卡片按钮绑定到当前
-  飞书会话。
+- `/threads [keyword]`：当前仅在 `CODEX_RUNTIME=app-server` 下检索 Codex
+  Desktop 对话，并用卡片按钮绑定到当前飞书会话。
 - `/interrupt <task>`：打断当前任务，并把新任务放到队首执行。
 - `/cancel <task_id>`：取消一个等待任务。
 - `/clear-queue`：清空当前会话中属于当前用户的等待任务。
-- `/model [model_name] [reasoning_effort]`：查看或设置当前飞书会话使用的
-  Codex 模型配置。
-- `/reset`：清空当前飞书会话绑定的 Codex thread。
-- `/status`：查看机器人状态。
+- `/model [model_name] [reasoning_effort]`：查看或设置当前飞书会话模型；
+  Claude Code runtime 下作为 `--model` 候选值，低于 `CLAUDE_CODE_MODEL`。
+- `/reset`：清空当前 runtime 的会话绑定，本机历史文件不会删除。
+- `/status`：查看机器人状态和当前 runtime。
 
 普通问答和只读查询默认直接执行。命中写文件、删除、重启、部署、安装、提交、
 推送、配置修改、外部系统或 MCP 等关键词的任务，会先发送飞书审批卡片。
 
-同一飞书会话中只能有一个 Codex turn 正在运行。当前任务运行期间继续发送普通
+同一飞书会话中只能有一个 agent turn 正在运行。当前任务运行期间继续发送普通
 消息时，机器人会发送入队卡片。入队卡片提供 **打断并执行** 和 **取消排队**
 按钮；运行卡片提供 **打断** 和 **查看队列** 按钮。被打断的任务不会自动恢复，
 如果仍需继续，需要重新发送任务。
 
 ## 回复格式
 
-机器人使用飞书 Card JSON 2.0 渲染 Codex 回复。代码块保留 Markdown fenced
+机器人使用飞书 Card JSON 2.0 渲染 agent 回复。代码块保留 Markdown fenced
 code block，行内代码会转换成飞书 `text_tag` 标签，Markdown 表格会转换成飞书
 原生 `table` 组件。
 
@@ -495,27 +523,26 @@ thread。该模式创建的 thread 更容易出现在 Codex Desktop 侧边栏中
 会记录对应的 `codex_thread_id`。后续消息会继续这个 thread，但不会把历史聊天
 内容回放到飞书卡片中。
 
-## Claude Code/DeepSeek runtime
+## Claude Code runtime
 
 当 `CODEX_RUNTIME=claude-code` 时，机器人不会启动 Codex SDK，也不会调用
 `codex app-server`。它会启动 `CLAUDE_CODE_BIN`，读取 Claude Code 的
 `stream-json` 输出，并映射成现有飞书卡片事件。
 
-Claude 进程的入口由 `.env.claude` 中的 `CLAUDE_CODE_BIN` 决定。以下是示例
-路径。
+Claude 进程的入口由 `.env.claude` 中的 `CLAUDE_CODE_BIN` 决定。以下是示例。
 
 ```text
-$HOME/.local/bin/claude-deepseek-v4
+claude
 ```
 
-该包装命令需要设置 DeepSeek 的 Anthropic 兼容环境变量，然后执行 `claude`。
 机器人启动 Claude Code 的参数为：
 
 ```bash
 --print \
 --verbose \
 --output-format stream-json \
---include-partial-messages
+--include-partial-messages \
+--permission-mode <mode>
 ```
 
 如果当前飞书会话已有 `claude_session_id`，机器人还会传入：
@@ -524,17 +551,28 @@ $HOME/.local/bin/claude-deepseek-v4
 --resume <claude_session_id>
 ```
 
-Claude bot 的卡片标题会显示 `Claude Code/DeepSeek 正在处理`。如果需要修改显示
-名称，可以在 `.env.claude` 中设置：
+如果 `CLAUDE_CODE_MODEL`、飞书会话 `/model` 或 `CODEX_MODEL` 提供了模型值，
+机器人还会传入：
+
+```bash
+--model <model>
+```
+
+`CLAUDE_CODE_EXTRA_ARGS` 的内容位于固定参数之后，`--resume` 和 `--model` 之前。
+Claude 子进程还会收到 `CODEX_CHILD_GOMAXPROCS`、`CODEX_CHILD_GOFLAGS` 和
+`CODEX_CHILD_GOMEMLIMIT` 转换后的 Go 运行环境变量。
+
+Claude bot 的卡片标题默认显示 `ClaudeCode/{model} 正在处理`。没有可用模型值时
+显示 `ClaudeCode 正在处理`。如果需要固定显示名称，可以在 `.env.claude` 中设置：
 
 ```env
-CLAUDE_CODE_DISPLAY_NAME=Claude Code/DeepSeek
+CLAUDE_CODE_DISPLAY_NAME=ClaudeCode/team
 ```
 
 `/threads` 是 Codex `app-server` 的能力。Claude bot 没有 Codex Desktop thread
 列表协议，因此在 `claude-code` runtime 下不会提供 Desktop thread 选择。
 
-### 验证 Claude Code/DeepSeek 调用
+### 验证 Claude Code 调用
 
 查看 Claude bot 日志可以确认实际调用链。
 
@@ -545,19 +583,17 @@ tail -f logs/launchd.claude.out.log | rg 'Runtime|ClaudeCode'
 正常请求会出现类似日志：
 
 ```text
-[Runtime] requesting Claude Code/DeepSeek kind=claude-code
-[ClaudeCode] start bin=$HOME/.local/bin/claude-deepseek-v4 ...
-[ClaudeCode] init session=... model=deepseek-v4-pro[1m] version=...
-[ClaudeCode] result session=... status=success ... modelUsage=deepseek-v4-pro[1m],deepseek-v4-flash
+[Runtime] requesting ClaudeCode/sonnet kind=claude-code
+[ClaudeCode] start bin=claude ...
+[ClaudeCode] init session=... model=sonnet version=...
+[ClaudeCode] result session=... status=success ... modelUsage=sonnet
 ```
 
 关键字段含义如下。
 
 - `kind=claude-code` 表示当前运行后端不是 Codex。
-- `bin=$HOME/.local/bin/claude-deepseek-v4` 表示启动了本机
-  Claude Code/DeepSeek 包装命令。
-- `model=deepseek-v4-pro[1m]` 或 `modelUsage=deepseek...` 表示 Claude Code
-  通过 DeepSeek 模型返回。
+- `bin=claude` 表示启动了本机 Claude Code 命令。
+- `model=sonnet` 或 `modelUsage=sonnet` 表示 Claude Code 返回了模型信息。
 
 ## 会话与数据文件
 
@@ -643,10 +679,11 @@ launchctl kickstart -k gui/$(id -u)/ai.feishu-claude-bot
 tail -n 40 logs/launchd.claude.out.log | rg 'Runtime|Claude'
 ```
 
-日志中应出现 `name=Claude Code/DeepSeek kind=claude-code`。旧卡片已经发送到
-飞书后不会自动改标题，需要用新消息验证。
+日志中应出现 `name=ClaudeCode/sonnet kind=claude-code` 或
+`name=ClaudeCode kind=claude-code`。旧卡片已经发送到飞书后不会自动改标题，
+需要用新消息验证。
 
-### 无法确认 Claude bot 是否调用 DeepSeek
+### 无法确认 Claude bot 是否调用 Claude Code
 
 检查 Claude bot 日志中的 Claude Code 初始化和 result 事件。
 
@@ -654,9 +691,9 @@ tail -n 40 logs/launchd.claude.out.log | rg 'Runtime|Claude'
 tail -f logs/launchd.claude.out.log | rg 'ClaudeCode'
 ```
 
-日志中应出现 `bin=$HOME/.local/bin/claude-deepseek-v4`，以及
-`model=deepseek-v4-pro[1m]` 或 `modelUsage=deepseek...`。这些字段来自
-Claude Code 的 `stream-json` 输出，不来自飞书卡片。
+日志中应出现 `bin=claude` 或你配置的 `CLAUDE_CODE_BIN`，以及 `model=...` 或
+`modelUsage=...`。这些字段来自 Claude Code 的 `stream-json` 输出，不来自
+飞书卡片。
 
 ## 安全注意事项
 

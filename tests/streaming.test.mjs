@@ -77,11 +77,11 @@ test('formats agent response and command timeline from Codex events', () => {
 });
 
 test('formats agent card with runtime label', () => {
-  const state = createStreamState('hi', 'running', 'Claude Code/DeepSeek');
+  const state = createStreamState('hi', 'running', 'ClaudeCode/sonnet');
   const card = buildAgentCard(state);
 
-  assert.equal(card.header.title.content, 'Claude Code/DeepSeek 正在处理');
-  assert.match(formatStreamState(state), /Claude Code\/DeepSeek 正在处理/);
+  assert.equal(card.header.title.content, 'ClaudeCode/sonnet 正在处理');
+  assert.match(formatStreamState(state), /ClaudeCode\/sonnet 正在处理/);
 });
 
 test('keeps final response and completed mcp timeline', () => {
@@ -382,7 +382,8 @@ test('queue cards render waiting task controls and summary', () => {
   const summaryCard = buildQueueSummaryCard({ sessionKey: 'chat:user', currentTask, queue: [task] });
   const buttons = cardElements(queuedCard).filter((item) => item.tag === 'button');
 
-  assert.equal(queuedCard.header.title.content, 'Codex 已加入队列');
+  assert.equal(queuedCard.header.title.content, 'Agent 已加入队列');
+  assert.equal(summaryCard.header.title.content, 'Agent 队列');
   assert.equal(queuedCard.schema, '2.0');
   assert.equal(buttons[0].behaviors[0].value.action, 'interrupt_with_task');
   assert.equal(buttons[1].behaviors[0].value.action, 'cancel_queued_task');

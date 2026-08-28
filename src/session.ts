@@ -12,6 +12,16 @@ export type SessionRecord = {
     updated_at: string;
 };
 
+export function runtimeSessionIdField(runtimeKind: string): 'codex_thread_id' | 'claude_session_id' {
+    return runtimeKind === 'claude-code' ? 'claude_session_id' : 'codex_thread_id';
+}
+
+export function clearRuntimeSessionId(record: SessionRecord, runtimeKind: string): SessionRecord {
+    const next = { ...record };
+    delete next[runtimeSessionIdField(runtimeKind)];
+    return next;
+}
+
 export function makeSessionKey(chatId: string, senderOpenId: string) {
     return `${chatId}:${senderOpenId || 'unknown'}`;
 }

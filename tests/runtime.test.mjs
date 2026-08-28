@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
 import {
@@ -6,16 +7,24 @@ import {
   CodexAppServerRuntime,
   buildCodexAppServerSpawn,
   mapAppServerNotification,
+  shouldTerminateAppServerChild,
 } from '../dist/appServerRuntime.js';
 import {
   createClaudeCodeEventMapper,
 } from '../dist/claudeCodeRuntime.js';
 import {
   applyCodexResourceEnv,
+  buildRuntimeRetryParams,
   buildRuntimePolicy,
+  isRuntimeConnectionClosedEvent,
+  isRetryableThreadError,
   loadCodexResourceLimits,
+  runtimeDisplayNameForKind,
   selectCodexRuntimeKind,
+  shouldFlushFinalStreamState,
 } from '../dist/runtime.js';
+
+const collectTimeout = Symbol('collectTimeout');
 
 function createRpcHarness() {
   const stdin = new PassThrough();
@@ -28,12 +37,76 @@ function createRpcHarness() {
   return { client, stdout, writes };
 }
 
+function createChildHarness(pid = 1234) {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const writes = [];
+  stdin.on('data', (chunk) => {
+    writes.push(...String(chunk).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line)));
+  });
+  const child = Object.assign(new EventEmitter(), {
+    stdin,
+    stdout,
+    stderr,
+    pid,
+    exitCode: null,
+    kill() {
+      child.exitCode = 0;
+      child.emit('exit', 0, null);
+      return true;
+    },
+  });
+  return { child, stdout, writes };
+}
+
+function tick() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+async function collectEvents(iterable) {
+  const events = [];
+  for await (const event of iterable) {
+    events.push(event);
+  }
+  return events;
+}
+
+async function collectEventsWithTimeout(iterable, timeoutMs = 50) {
+  return Promise.race([
+    collectEvents(iterable),
+    new Promise((resolve) => setTimeout(() => resolve(collectTimeout), timeoutMs)),
+  ]);
+}
+
+function findRequest(writes, method, predicate = () => true) {
+  for (let index = writes.length - 1; index >= 0; index--) {
+    const entry = writes[index];
+    if (entry.method === method && predicate(entry)) return entry;
+  }
+  return null;
+}
+
+function writeResponse(stdout, request, result) {
+  stdout.write(JSON.stringify({ id: request.id, result }) + '\n');
+}
+
 test('selects exec SDK runtime unless app-server is explicitly enabled', () => {
   assert.equal(selectCodexRuntimeKind({}), 'exec-sdk');
   assert.equal(selectCodexRuntimeKind({ CODEX_RUNTIME: 'exec-sdk' }), 'exec-sdk');
   assert.equal(selectCodexRuntimeKind({ CODEX_RUNTIME: 'app-server' }), 'app-server');
   assert.equal(selectCodexRuntimeKind({ CODEX_RUNTIME: 'claude-code' }), 'claude-code');
   assert.equal(selectCodexRuntimeKind({ CODEX_RUNTIME: 'invalid' }), 'exec-sdk');
+});
+
+test('formats runtime display name from Claude model by default', () => {
+  assert.equal(runtimeDisplayNameForKind('exec-sdk', {}, undefined), 'Codex');
+  assert.equal(runtimeDisplayNameForKind('app-server', {}, undefined), 'Codex');
+  assert.equal(runtimeDisplayNameForKind('claude-code', {}, undefined), 'ClaudeCode');
+  assert.equal(runtimeDisplayNameForKind('claude-code', {}, 'sonnet'), 'ClaudeCode/sonnet');
+  assert.equal(runtimeDisplayNameForKind('claude-code', { CODEX_MODEL: 'opus' }, undefined), 'ClaudeCode/opus');
+  assert.equal(runtimeDisplayNameForKind('claude-code', { CLAUDE_CODE_MODEL: 'haiku' }, 'sonnet'), 'ClaudeCode/haiku');
+  assert.equal(runtimeDisplayNameForKind('claude-code', { CLAUDE_CODE_DISPLAY_NAME: 'Claude Bot' }, 'sonnet'), 'Claude Bot');
 });
 
 test('builds shared runtime policy from environment and task policy', () => {
@@ -139,6 +212,72 @@ test('builds app-server spawn command with unix resource wrapper', () => {
   assert.equal(spawn.detached, true);
 });
 
+test('app-server stop is skipped while another active turn still uses the same child', () => {
+  const currentChild = { pid: 123, exitCode: null };
+  const replacementChild = { pid: 456, exitCode: null };
+
+  assert.equal(shouldTerminateAppServerChild(currentChild, currentChild, 1), false);
+  assert.equal(shouldTerminateAppServerChild(replacementChild, currentChild, 0), false);
+  assert.equal(shouldTerminateAppServerChild(currentChild, currentChild, 0), true);
+});
+
+test('runtime retry keeps the existing Feishu target message id', () => {
+  const params = {
+    chatId: 'chat-1',
+    senderOpenId: 'ou-user',
+    sessionKey: 'chat-1:ou-user',
+    sourceMessageId: 'om-source',
+    userText: 'hello',
+    id: 'task-1',
+    privileged: false,
+    targetMessageId: null,
+    isInterrupted: () => false,
+  };
+
+  const retryParams = buildRuntimeRetryParams(params, 'om-target');
+
+  assert.equal(retryParams.targetMessageId, 'om-target');
+  assert.equal(retryParams.retried, true);
+  assert.equal(params.targetMessageId, null);
+  assert.equal(params.retried, undefined);
+});
+
+test('runtime retry accepts stale thread errors only once', () => {
+  assert.equal(isRetryableThreadError('thread not found: thread-1', false), true);
+  assert.equal(isRetryableThreadError('app-server JSON-RPC client closed', false), true);
+  assert.equal(isRetryableThreadError('JSON-RPC client closed', false), true);
+  assert.equal(isRetryableThreadError('thread not found: thread-1', true), false);
+  assert.equal(isRetryableThreadError('permission denied', false), false);
+});
+
+test('detects runtime connection closed events for session identity cleanup', () => {
+  assert.equal(isRuntimeConnectionClosedEvent({
+    type: 'turn.failed',
+    error: { message: 'app-server JSON-RPC client closed' },
+  }), true);
+  assert.equal(isRuntimeConnectionClosedEvent({
+    type: 'error',
+    message: 'JSON-RPC client is closed',
+  }), true);
+  assert.equal(isRuntimeConnectionClosedEvent({
+    type: 'turn.failed',
+    error: { message: 'permission denied' },
+  }), false);
+  assert.equal(isRuntimeConnectionClosedEvent({
+    type: 'item.completed',
+    item: { type: 'agent_message', text: 'done' },
+  }), false);
+});
+
+test('stream final update is skipped after delegating retry to avoid stale card overwrite', () => {
+  const runningState = { phase: 'running', responseText: 'partial' };
+  const failedState = { phase: 'failed', responseText: 'partial' };
+
+  assert.equal(shouldFlushFinalStreamState(failedState, runningState, true), false);
+  assert.equal(shouldFlushFinalStreamState(failedState, runningState, false), true);
+  assert.equal(shouldFlushFinalStreamState(runningState, runningState, false), false);
+});
+
 test('JSON-RPC client writes newline-delimited requests and resolves matching response', async () => {
   const { client, stdout, writes } = createRpcHarness();
   const promise = client.request('thread/list', { limit: 1 });
@@ -162,6 +301,160 @@ test('JSON-RPC client rejects app-server errors', async () => {
 
   await assert.rejects(promise, /not found/);
   client.close();
+});
+
+test('JSON-RPC client reports close instead of request abort for pending signaled requests', async () => {
+  const { client } = createRpcHarness();
+  const controller = new AbortController();
+  const promise = client.request('turn/start', { threadId: 'thread-1' }, controller.signal);
+
+  client.close();
+
+  await assert.rejects(promise, /app-server JSON-RPC client closed/);
+});
+
+test('app-server runtime throws when the JSON-RPC client closes mid-turn so caller can retry', async () => {
+  const { client, stdout, writes } = createRpcHarness();
+  const runtime = new CodexAppServerRuntime({ env: {}, client });
+  const policy = buildRuntimePolicy({
+    env: {},
+    workingDirectory: '/tmp/project',
+    sandboxMode: 'workspace-write',
+    approvalPolicy: 'never',
+  });
+
+  const threadPromise = runtime.startThread(policy);
+  await tick();
+  stdout.write(JSON.stringify({ id: writes[0].id, result: { thread: { id: 'thread-1' } } }) + '\n');
+  const thread = await threadPromise;
+
+  const { events } = await thread.runStreamed('hello');
+  const collected = collectEventsWithTimeout(events);
+  await tick();
+  stdout.write(JSON.stringify({ id: writes[1].id, result: { turn: { id: 'turn-1' } } }) + '\n');
+  await tick();
+  client.close();
+
+  await assert.rejects(collected, /app-server JSON-RPC client closed/);
+});
+
+test('app-server runtime creates a new client after cached client closes before process exit', async () => {
+  const first = createRpcHarness();
+  let spawned = null;
+  const runtime = new CodexAppServerRuntime({
+    env: {},
+    client: first.client,
+    spawnFn: () => {
+      spawned = createChildHarness(5678);
+      return spawned.child;
+    },
+  });
+
+  first.client.close();
+  const listPromise = runtime.listThreads({ limit: 1 });
+  await tick();
+
+  assert.notEqual(spawned, null);
+  assert.equal(spawned.writes[0].method, 'initialize');
+  spawned.stdout.write(JSON.stringify({ id: spawned.writes[0].id, result: {} }) + '\n');
+  await tick();
+  const listRequest = spawned.writes.find((entry) => entry.method === 'thread/list');
+  assert.ok(listRequest);
+  spawned.stdout.write(JSON.stringify({
+    id: listRequest.id,
+    result: { data: [], nextCursor: null },
+  }) + '\n');
+
+  assert.deepEqual(await listPromise, []);
+  spawned.child.emit('exit', 0, null);
+});
+
+test('aborting one app-server turn does not terminate a shared child while another turn is active', async () => {
+  const spawned = createChildHarness(24680);
+  const originalKill = process.kill;
+  const killCalls = [];
+  process.kill = (pid, signal) => {
+    killCalls.push({ pid, signal });
+    return true;
+  };
+
+  try {
+    const runtime = new CodexAppServerRuntime({
+      env: {},
+      spawnFn: () => spawned.child,
+      resourceLimits: {
+        maxActiveTasks: 2,
+        taskTimeoutMs: 1000,
+        processNice: 0,
+        cpuTimeSeconds: 0,
+        goMaxProcs: 2,
+        goFlags: '-p=1',
+        goMemoryLimit: '',
+        appServerIdleShutdownMs: 0,
+        interruptKillGraceMs: 5,
+        processGroupKill: false,
+      },
+    });
+    const policy = buildRuntimePolicy({
+      env: {},
+      workingDirectory: '/tmp/project',
+      sandboxMode: 'workspace-write',
+      approvalPolicy: 'never',
+    });
+
+    const firstThreadPromise = runtime.startThread(policy);
+    await tick();
+    writeResponse(spawned.stdout, findRequest(spawned.writes, 'initialize'), {});
+    await tick();
+    writeResponse(spawned.stdout, findRequest(spawned.writes, 'thread/start'), { thread: { id: 'thread-1' } });
+    const firstThread = await firstThreadPromise;
+
+    const secondThreadPromise = runtime.startThread(policy);
+    await tick();
+    writeResponse(spawned.stdout, findRequest(spawned.writes, 'thread/start'), { thread: { id: 'thread-2' } });
+    const secondThread = await secondThreadPromise;
+
+    const controller = new AbortController();
+    const { events: firstEvents } = await firstThread.runStreamed('one', { signal: controller.signal });
+    const { events: secondEvents } = await secondThread.runStreamed('two');
+    const firstCollected = collectEventsWithTimeout(firstEvents, 100);
+    const secondCollected = collectEventsWithTimeout(secondEvents, 100);
+    await tick();
+
+    writeResponse(
+      spawned.stdout,
+      findRequest(spawned.writes, 'turn/start', (entry) => entry.params.threadId === 'thread-1'),
+      { turn: { id: 'turn-1' } },
+    );
+    writeResponse(
+      spawned.stdout,
+      findRequest(spawned.writes, 'turn/start', (entry) => entry.params.threadId === 'thread-2'),
+      { turn: { id: 'turn-2' } },
+    );
+    await tick();
+
+    controller.abort();
+    await tick();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.deepEqual(await firstCollected, []);
+    assert.deepEqual(killCalls, []);
+
+    spawned.stdout.write(JSON.stringify({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-2',
+        turnId: 'turn-2',
+        turn: { id: 'turn-2', status: 'completed' },
+      },
+    }) + '\n');
+
+    assert.deepEqual(await secondCollected, [{ type: 'turn.completed' }]);
+    assert.deepEqual(killCalls, []);
+    spawned.child.emit('exit', 0, null);
+  } finally {
+    process.kill = originalKill;
+  }
 });
 
 test('app-server runtime lists desktop threads without reading turns', async () => {

@@ -4,8 +4,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { spawnSync } from 'child_process';
 import { getRunPolicy, requiresFeishuApproval } from './approval.js';
-import { applyCodexResourceEnv, buildRuntimePolicy, CodexRuntime, CodexRuntimeKind, CodexThreadHandle, createCodexRuntime, loadCodexResourceLimits, selectCodexRuntimeKind } from './runtime.js';
-import { bindSessionThreadRecord, buildSessionRecord, makeSessionKey, normalizeSessionMap, SessionRecord } from './session.js';
+import { applyCodexResourceEnv, buildRuntimePolicy, buildRuntimeRetryParams, CodexRuntime, CodexRuntimeKind, CodexThreadHandle, createCodexRuntime, isRetryableThreadError, isRuntimeConnectionClosedEvent, loadCodexResourceLimits, runtimeDisplayNameForKind, selectCodexRuntimeKind, shouldFlushFinalStreamState } from './runtime.js';
+import { bindSessionThreadRecord, buildSessionRecord, clearRuntimeSessionId, makeSessionKey, normalizeSessionMap, runtimeSessionIdField, SessionRecord } from './session.js';
 import { startWebServer, updateStats, addLog } from './server.js';
 import {
     buildAgentCard,
@@ -354,9 +354,9 @@ async function handleSlashCommand(userText: string, params: {
         }
         setSessionModelConfig(params.sessionKey, selection.model, selection.reasoningEffort);
         await replyText(params.messageId, [
-            '当前会话 Codex 配置已更新:',
-            `模型: ${getSessionModel(params.sessionKey) || 'Codex CLI 默认模型'}`,
-            `Reasoning effort: ${getSessionReasoningEffort(params.sessionKey) || 'Codex CLI 默认值'}`,
+            '当前会话模型配置已更新:',
+            `模型: ${getSessionModel(params.sessionKey) || runtimeDefaultModelName()}`,
+            `Reasoning effort: ${getSessionReasoningEffort(params.sessionKey) || runtimeDefaultReasoningName()}`,
         ].join('\n'));
         return { handled: true };
     }
@@ -372,7 +372,7 @@ async function handleSlashCommand(userText: string, params: {
     }
     if (command.name === 'threads') {
         if (!codexRuntime.listThreads) {
-            await replyText(params.messageId, '当前 Codex runtime 不支持 Desktop 对话检索。请使用 CODEX_RUNTIME=app-server。');
+            await replyText(params.messageId, '当前 runtime 不支持 Desktop 对话检索。请使用 CODEX_RUNTIME=app-server。');
             return { handled: true };
         }
         try {
@@ -413,10 +413,12 @@ async function handleSlashCommand(userText: string, params: {
     if (command.name === 'reset' || command.name === 'clear') {
         resetSessionThread(params.sessionKey);
         updateStats({ sessions: Object.keys(sessionMap).length });
-        await replyText(params.messageId, '已开启新对话。当前 Codex thread 绑定已移除，本机历史文件不会删除。');
+        await replyText(params.messageId, '已开启新对话。当前 runtime 会话绑定已移除，本机历史文件不会删除。');
         return { handled: true };
     }
     if (command.name === 'status') {
+        const runtimeName = runtimeDisplayName(codexRuntime.kind, getSessionModel(params.sessionKey));
+        const runtimeSessionId = getRuntimeSessionId(sessionMap[params.sessionKey], codexRuntime.kind);
         await replyText(params.messageId, [
             '机器人状态',
             '',
@@ -424,7 +426,10 @@ async function handleSlashCommand(userText: string, params: {
             `活跃会话: ${Object.keys(sessionMap).length}`,
             `处理消息: ${messageCount}`,
             `运行时间: ${getUptime()}`,
-            'Codex SDK: 已连接',
+            `Runtime: ${runtimeName}`,
+            `Runtime kind: ${codexRuntime.kind}`,
+            `会话字段: ${runtimeSessionIdField(codexRuntime.kind)}`,
+            `当前会话绑定: ${runtimeSessionId ? '已绑定' : '无'}`,
             '飞书 WebSocket: 已连接',
         ].join('\n'));
         return { handled: true };
@@ -447,7 +452,7 @@ function rewriteExecutableSlash(text: string): { text?: string; error?: string }
 
 function formatQueueAsText(current: QueuedTask | null, queue: QueuedTask[]) {
     const lines = [
-        'Codex 队列',
+        'Agent 队列',
         '',
         `当前运行: ${current ? current.userText : '无'}`,
         '',
@@ -549,7 +554,7 @@ function armTaskTimeout(runner: SessionRunner, task: QueuedTask): NodeJS.Timeout
         runner.abortController?.abort();
         const seconds = Math.round(codexResourceLimits.taskTimeoutMs / 1000);
         console.warn(`[ResourceLimits] task timeout after ${seconds}s: ${task.id}`);
-        addLog('warn', `任务超过 ${seconds}s，已请求停止 Codex: ${task.id}`);
+        addLog('warn', `任务超过 ${seconds}s，已请求停止 ${runtimeDisplayName(codexRuntime.kind)}: ${task.id}`);
     }, codexResourceLimits.taskTimeoutMs);
 }
 
@@ -562,22 +567,23 @@ async function runUserTaskNow(runner: SessionRunner, task: QueuedTask) {
         if (needsApproval) {
             const approvalId = createApprovalId();
             task.approvalId = approvalId;
+            const approvalRuntimeName = runtimeDisplayName(codexRuntime.kind, getSessionModel(task.sessionKey));
             const approvalState = createApprovalState(task.userText, approvalId, [
                 `Sandbox: ${getRunPolicy(true).sandboxMode}`,
                 `Approval policy: ${getRunPolicy(true).approvalPolicy}`,
                 `Workdir: ${resolveTaskDirectories(task.userText).workingDirectory}`,
                 `文本审批: approve ${approvalId} / deny ${approvalId}`,
-            ].join('\n'), runtimeDisplayName(codexRuntime.kind));
+            ].join('\n'), approvalRuntimeName);
             targetMessageId = await replyInteractive(task.sourceMessageId, approvalState);
             task.targetMessageId = targetMessageId;
             const approved = await waitForApproval(approvalId, task.senderOpenId);
             task.approvalId = undefined;
             if (!approved) {
                 const failedState = runner.interrupted
-                    ? markStreamInterrupted(approvalState, '审批等待期间任务已被打断，Codex 未启动。')
+                    ? markStreamInterrupted(approvalState, `审批等待期间任务已被打断，${approvalRuntimeName} 未启动。`)
                     : updateStreamState(approvalState, {
                         type: 'error',
-                        message: '飞书审批未通过或超时，Codex 未启动。',
+                        message: `飞书审批未通过或超时，${approvalRuntimeName} 未启动。`,
                     });
                 await updateInteractiveOrText(task.sourceMessageId, targetMessageId, failedState);
                 return;
@@ -758,10 +764,11 @@ async function runCodexStreamToFeishu(params: {
     privileged: boolean;
     targetMessageId: string | null;
     signal?: AbortSignal;
+    retried?: boolean;
     isInterrupted: () => boolean;
 }) {
     const policy = getRunPolicy(params.privileged);
-    let state = createStreamState(params.userText, 'running', runtimeDisplayName(codexRuntime.kind));
+    let state = createStreamState(params.userText, 'running', runtimeDisplayName(codexRuntime.kind, getSessionModel(params.sessionKey)));
     const cardOptions = runtimeCardOptions(params);
     const targetMessageId = params.targetMessageId || await replyInteractive(params.sourceMessageId, state, cardOptions);
     if (params.targetMessageId) {
@@ -770,15 +777,22 @@ async function runCodexStreamToFeishu(params: {
     let lastState = state;
     let lastResponseLength = 0;
     let lastUpdateAt = Date.now();
+    let delegatedRetry = false;
+    let runtimeConnectionClosed = false;
 
     try {
         const thread = await getOrCreateThread(params.sessionKey, policy, params.userText);
-        console.log(`[Runtime] requesting ${runtimeDisplayName(codexRuntime.kind)} kind=${codexRuntime.kind}`);
+        console.log(`[Runtime] requesting ${runtimeDisplayName(codexRuntime.kind, getSessionModel(params.sessionKey))} kind=${codexRuntime.kind}`);
         const { events } = await thread.runStreamed(params.userText, { signal: params.signal });
 
         for await (const event of events) {
             const nextState = updateStreamState(state, event);
-            await rememberThread(params, thread);
+            if (isRuntimeConnectionClosedEvent(event)) {
+                runtimeConnectionClosed = true;
+                clearRuntimeSessionIdentity(params.sessionKey);
+            } else if (!runtimeConnectionClosed) {
+                await rememberThread(params, thread);
+            }
 
             const now = Date.now();
             const shouldPatch = shouldUpdateCard(state, nextState, lastResponseLength);
@@ -792,7 +806,9 @@ async function runCodexStreamToFeishu(params: {
             state = nextState;
         }
 
-        await rememberThread(params, thread);
+        if (!runtimeConnectionClosed) {
+            await rememberThread(params, thread);
+        }
         if (params.isInterrupted()) {
             state = markStreamInterrupted(state);
         }
@@ -802,34 +818,28 @@ async function runCodexStreamToFeishu(params: {
             addLog('info', `任务已被打断: ${params.id}`);
         } else {
             const message = err instanceof Error ? err.message : String(err);
-            const isThreadError = message.includes('thread not found') || message.includes('JSON-RPC client closed');
-            const isRetryable = isThreadError && !(params as any).__retried;
-            if (isRetryable) {
+            if (isRetryableThreadError(message, params.retried)) {
                 console.warn(`[会话 ${params.sessionKey}] 线程/app-server 失效，清理状态并重试: ${message}`);
-                if (sessionMap[params.sessionKey]) {
-                    delete sessionMap[params.sessionKey].codex_thread_id;
-                }
-                threadMap.delete(params.sessionKey);
-                (params as any).__retried = true;
-                await runCodexStreamToFeishu(params);
+                clearRuntimeSessionIdentity(params.sessionKey);
+                delegatedRetry = true;
+                await runCodexStreamToFeishu(buildRuntimeRetryParams(params, targetMessageId));
                 return;
             }
             state = updateStreamState(state, { type: 'error', message });
-            console.error(`${runtimeDisplayName(codexRuntime.kind)} 流式处理出错:`, err);
-            addLog('error', `${runtimeDisplayName(codexRuntime.kind)} 流式处理出错: ${message}`);
+            console.error(`${runtimeDisplayName(codexRuntime.kind, getSessionModel(params.sessionKey))} 流式处理出错:`, err);
+            addLog('error', `${runtimeDisplayName(codexRuntime.kind, getSessionModel(params.sessionKey))} 流式处理出错: ${message}`);
         }
     } finally {
-        if (JSON.stringify(state) !== JSON.stringify(lastState)) {
+        if (shouldFlushFinalStreamState(state, lastState, delegatedRetry)) {
             await updateInteractiveOrText(params.sourceMessageId, targetMessageId, state, runtimeCardOptions(params));
         }
     }
 
-    console.log(`[${runtimeDisplayName(codexRuntime.kind)} 回复] ${state.responseText.substring(0, 50)}...`);
+    console.log(`[${runtimeDisplayName(codexRuntime.kind, getSessionModel(params.sessionKey))} 回复] ${state.responseText.substring(0, 50)}...`);
 }
 
-function runtimeDisplayName(kind: CodexRuntimeKind) {
-    if (kind === 'claude-code') return process.env.CLAUDE_CODE_DISPLAY_NAME?.trim() || 'Claude Code/DeepSeek';
-    return 'Codex';
+function runtimeDisplayName(kind: CodexRuntimeKind, sessionModel?: string) {
+    return runtimeDisplayNameForKind(kind, process.env, sessionModel);
 }
 
 function runtimeCardOptions(params: {
@@ -933,7 +943,15 @@ async function rememberThread(params: {
 
 function getRuntimeSessionId(record: SessionRecord | undefined, kind: CodexRuntimeKind) {
     if (!record) return undefined;
-    return kind === 'claude-code' ? record.claude_session_id : record.codex_thread_id;
+    return record[runtimeSessionIdField(kind)];
+}
+
+function clearRuntimeSessionIdentity(sessionKey: string) {
+    const previous = sessionMap[sessionKey];
+    if (!previous) return;
+    sessionMap[sessionKey] = clearRuntimeSessionId(previous, codexRuntime.kind);
+    threadMap.delete(sessionKey);
+    saveSessions();
 }
 
 function getWorkingDirectory() {
@@ -963,6 +981,14 @@ function getDefaultModel() {
 
 function getDefaultReasoningEffort() {
     return process.env.CODEX_REASONING_EFFORT?.trim() || 'medium';
+}
+
+function runtimeDefaultModelName() {
+    return codexRuntime.kind === 'claude-code' ? 'Claude Code 默认模型' : 'Codex CLI 默认模型';
+}
+
+function runtimeDefaultReasoningName() {
+    return codexRuntime.kind === 'claude-code' ? 'runtime 默认值' : 'Codex CLI 默认值';
 }
 
 function getSessionModel(sessionKey: string) {

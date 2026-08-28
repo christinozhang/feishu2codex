@@ -17,6 +17,8 @@ type PendingRequest = {
     cleanup?: () => void;
 };
 
+type SpawnFn = typeof spawn;
+
 type MapperState = {
     assistantTexts: Map<string, string>;
     commandItems: Map<string, any>;
@@ -72,18 +74,24 @@ export class AppServerJsonRpcClient {
         return () => this.emitter.off('notification', handler);
     }
 
+    onClose(handler: () => void) {
+        this.emitter.on('close', handler);
+        return () => this.emitter.off('close', handler);
+    }
+
+    isClosed() {
+        return this.closed;
+    }
+
     close() {
         if (this.closed) return;
         this.closed = true;
         for (const [id, pending] of this.pending.entries()) {
-            if (pending.abort) {
-                pending.abort();
-            } else {
-                pending.cleanup?.();
-                pending.reject(new Error('app-server JSON-RPC client closed'));
-            }
             this.pending.delete(id);
+            pending.cleanup?.();
+            pending.reject(new Error('app-server JSON-RPC client closed'));
         }
+        this.emitter.emit('close');
     }
 
     private handleLine(line: string) {
@@ -118,6 +126,7 @@ export class CodexAppServerRuntime implements CodexRuntime {
     private readonly codexBin: string;
     private readonly env: Record<string, string | undefined>;
     private readonly resourceLimits: CodexResourceLimits;
+    private readonly spawnFn: SpawnFn;
     private child: ChildProcessWithoutNullStreams | null = null;
     private client: AppServerJsonRpcClient | null = null;
     private initializePromise: Promise<AppServerJsonRpcClient> | null = null;
@@ -129,10 +138,12 @@ export class CodexAppServerRuntime implements CodexRuntime {
         env: Record<string, string | undefined>;
         client?: AppServerJsonRpcClient;
         resourceLimits?: CodexResourceLimits;
+        spawnFn?: SpawnFn;
     }) {
         this.codexBin = params.codexBin || 'codex';
         this.env = params.env;
         this.resourceLimits = params.resourceLimits || loadCodexResourceLimits(params.env);
+        this.spawnFn = params.spawnFn || spawn;
         if (params.client) {
             this.client = params.client;
             this.initializePromise = Promise.resolve(params.client);
@@ -181,6 +192,7 @@ export class CodexAppServerRuntime implements CodexRuntime {
         const queue = createAsyncQueue<any>();
         let turnId: string | null = null;
         let removed = false;
+        let finished = false;
         this.activeTurns += 1;
 
         const removeListener = client.onNotification((notification) => {
@@ -194,12 +206,19 @@ export class CodexAppServerRuntime implements CodexRuntime {
             if (!event) return;
             queue.push(event);
             if (event.type === 'turn.completed' || event.type === 'turn.failed' || event.type === 'error') {
+                finished = true;
                 queue.end();
             }
+        });
+        const removeCloseListener = client.onClose(() => {
+            if (finished) return;
+            finished = true;
+            queue.fail(new Error('app-server JSON-RPC client closed'));
         });
 
         const abort = () => {
             if (turnId) client.request('turn/interrupt', { threadId, turnId }).catch(() => {});
+            finished = true;
             this.scheduleAppServerStop();
             queue.end();
         };
@@ -223,6 +242,7 @@ export class CodexAppServerRuntime implements CodexRuntime {
             if (!removed) {
                 removed = true;
                 removeListener();
+                removeCloseListener();
             }
             signal?.removeEventListener('abort', abort);
             this.activeTurns = Math.max(0, this.activeTurns - 1);
@@ -232,14 +252,18 @@ export class CodexAppServerRuntime implements CodexRuntime {
 
     private async ensureClient() {
         this.clearIdleShutdown();
-        if (this.initializePromise) return this.initializePromise;
+        if (this.initializePromise && this.client && !this.client.isClosed()) return this.initializePromise;
+        if (this.client?.isClosed()) {
+            this.client = null;
+            this.initializePromise = null;
+        }
         this.initializePromise = this.startAppServer();
         return this.initializePromise;
     }
 
     private async startAppServer() {
         const spawnConfig = buildCodexAppServerSpawn(this.codexBin, this.resourceLimits);
-        const child = spawn(spawnConfig.command, spawnConfig.args, {
+        const child = this.spawnFn(spawnConfig.command, spawnConfig.args, {
             env: this.env as NodeJS.ProcessEnv,
             stdio: ['pipe', 'pipe', 'pipe'],
             detached: spawnConfig.detached,
@@ -251,18 +275,27 @@ export class CodexAppServerRuntime implements CodexRuntime {
             stderr: child.stderr,
         });
         this.client = client;
-        const cleanup = () => {
-            client.close();
+        let initPromise: Promise<AppServerJsonRpcClient> | null = null;
+        const clearCachedClient = () => {
             if (this.client === client) this.client = null;
-            if (this.child === child) this.child = null;
             if (this.initializePromise === initPromise) this.initializePromise = null;
+        };
+        const removeCloseListener = client.onClose(() => {
+            clearCachedClient();
+            terminateChildProcess(child, this.resourceLimits);
+        });
+        const cleanup = () => {
+            removeCloseListener();
+            client.close();
+            clearCachedClient();
+            if (this.child === child) this.child = null;
         };
         child.on('exit', cleanup);
         child.stderr.on('data', (chunk) => {
             const text = String(chunk).trim();
             if (text) console.warn(`[app-server] ${text}`);
         });
-        const initPromise = (async () => {
+        initPromise = (async () => {
             await client.request('initialize', {
                 clientInfo: {
                     name: 'feishu2codex',
@@ -283,7 +316,10 @@ export class CodexAppServerRuntime implements CodexRuntime {
     private scheduleAppServerStop() {
         const child = this.child;
         if (!child?.pid) return;
-        setTimeout(() => terminateChildProcess(child, this.resourceLimits), this.resourceLimits.interruptKillGraceMs);
+        setTimeout(() => {
+            if (!shouldTerminateAppServerChild(this.child, child, this.activeTurns)) return;
+            terminateChildProcess(child, this.resourceLimits);
+        }, this.resourceLimits.interruptKillGraceMs);
     }
 
     private scheduleIdleShutdown() {
@@ -292,7 +328,7 @@ export class CodexAppServerRuntime implements CodexRuntime {
         const child = this.child;
         if (!child?.pid) return;
         this.idleShutdownTimer = setTimeout(() => {
-            if (this.activeTurns > 0) return;
+            if (!shouldTerminateAppServerChild(this.child, child, this.activeTurns)) return;
             terminateChildProcess(child, this.resourceLimits);
         }, this.resourceLimits.appServerIdleShutdownMs);
     }
@@ -309,6 +345,21 @@ export type AppServerSpawnConfig = {
     args: string[];
     detached: boolean;
 };
+
+type AppServerChildState = Pick<ChildProcessWithoutNullStreams, 'pid' | 'exitCode'> | null;
+
+export function shouldTerminateAppServerChild(
+    currentChild: AppServerChildState,
+    expectedChild: AppServerChildState,
+    activeTurns: number,
+) {
+    return Boolean(
+        expectedChild?.pid &&
+        expectedChild.exitCode === null &&
+        currentChild === expectedChild &&
+        activeTurns === 0,
+    );
+}
 
 export function buildCodexAppServerSpawn(
     codexBin: string,
@@ -548,22 +599,36 @@ function sandboxPolicy(mode: string) {
 
 function createAsyncQueue<T>() {
     const items: T[] = [];
-    const waiters: Array<(value: IteratorResult<T>) => void> = [];
+    const waiters: Array<{
+        resolve: (value: IteratorResult<T>) => void;
+        reject: (error: Error) => void;
+    }> = [];
     let done = false;
+    let failure: Error | null = null;
 
     return {
         push(item: T) {
+            if (done) return;
             const waiter = waiters.shift();
             if (waiter) {
-                waiter({ value: item, done: false });
+                waiter.resolve({ value: item, done: false });
                 return;
             }
             items.push(item);
         },
         end() {
+            if (done) return;
             done = true;
             while (waiters.length > 0) {
-                waiters.shift()?.({ value: undefined as T, done: true });
+                waiters.shift()?.resolve({ value: undefined as T, done: true });
+            }
+        },
+        fail(error: Error) {
+            if (done) return;
+            failure = error;
+            done = true;
+            while (waiters.length > 0) {
+                waiters.shift()?.reject(error);
             }
         },
         async *[Symbol.asyncIterator]() {
@@ -572,8 +637,11 @@ function createAsyncQueue<T>() {
                     yield items.shift() as T;
                     continue;
                 }
+                if (failure) throw failure;
                 if (done) return;
-                const next = await new Promise<IteratorResult<T>>((resolve) => waiters.push(resolve));
+                const next = await new Promise<IteratorResult<T>>((resolve, reject) => {
+                    waiters.push({ resolve, reject });
+                });
                 if (next.done) return;
                 yield next.value;
             }
