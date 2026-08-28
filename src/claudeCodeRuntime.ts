@@ -108,6 +108,10 @@ export class ClaudeCodeRuntime implements CodexRuntime {
                         `model=${message.model || 'unknown'}`,
                         `version=${message.claude_code_version || 'unknown'}`,
                     ].join(' '));
+                    yield {
+                        type: 'runtime.updated',
+                        runtimeLabel: claudeRuntimeDisplayName(this.env, message.model),
+                    };
                 }
                 if (message.type === 'result') {
                     const usage = message.modelUsage ? ` modelUsage=${Object.keys(message.modelUsage).join(',')}` : '';
@@ -323,4 +327,11 @@ function claudeExtraArgs(env: Record<string, string | undefined>) {
     const raw = env.CLAUDE_CODE_EXTRA_ARGS?.trim();
     if (!raw) return [];
     return raw.split(/\s+/).filter(Boolean);
+}
+
+function claudeRuntimeDisplayName(env: Record<string, string | undefined>, model: unknown) {
+    const configured = env.CLAUDE_CODE_DISPLAY_NAME?.trim();
+    if (configured) return configured;
+    const modelText = typeof model === 'string' ? model.trim() : '';
+    return modelText ? `ClaudeCode/${modelText}` : 'ClaudeCode';
 }

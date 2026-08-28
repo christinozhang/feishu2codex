@@ -562,8 +562,10 @@ claude
 Claude 子进程还会收到 `CODEX_CHILD_GOMAXPROCS`、`CODEX_CHILD_GOFLAGS` 和
 `CODEX_CHILD_GOMEMLIMIT` 转换后的 Go 运行环境变量。
 
-Claude bot 的卡片标题默认显示 `ClaudeCode/{model} 正在处理`。没有可用模型值时
-显示 `ClaudeCode 正在处理`。如果需要固定显示名称，可以在 `.env.claude` 中设置：
+Claude bot 的卡片标题默认显示 `ClaudeCode/{model} 正在处理`。启动时没有配置
+或会话模型时，初始标题为 `ClaudeCode 正在处理`；收到 Claude Code init 事件里的
+实际模型后，会更新为 `ClaudeCode/{model} 正在处理`。如果需要固定显示名称，可以在
+`.env.claude` 中设置：
 
 ```env
 CLAUDE_CODE_DISPLAY_NAME=ClaudeCode/team

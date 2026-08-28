@@ -120,6 +120,11 @@ export function createApprovalState(task: string, approvalId: string, detail: st
 }
 
 export function updateStreamState(state: StreamState, event: ThreadEvent | any): StreamState {
+    if (event.type === 'runtime.updated') {
+        const runtimeLabel = safeText(event.runtimeLabel, 40);
+        return runtimeLabel ? { ...state, runtimeLabel } : state;
+    }
+
     if (event.type === 'turn.completed') {
         return completeRunningWork({ ...state, phase: 'completed' });
     }
@@ -163,6 +168,7 @@ export function markStreamInterrupted(state: StreamState, detail = '用户已打
 }
 
 export function shouldUpdateCard(previous: StreamState, next: StreamState, lastResponseLength: number): boolean {
+    if (previous.runtimeLabel !== next.runtimeLabel) return true;
     if (previous.phase !== next.phase) return true;
     if (next.responseText.length - lastResponseLength >= 80) return true;
 

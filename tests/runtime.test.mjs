@@ -10,6 +10,7 @@ import {
   shouldTerminateAppServerChild,
 } from '../dist/appServerRuntime.js';
 import {
+  ClaudeCodeRuntime,
   createClaudeCodeEventMapper,
 } from '../dist/claudeCodeRuntime.js';
 import {
@@ -58,6 +59,29 @@ function createChildHarness(pid = 1234) {
     },
   });
   return { child, stdout, writes };
+}
+
+function createClaudeChildHarness(pid = 2345) {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const inputs = [];
+  stdin.on('data', (chunk) => {
+    inputs.push(String(chunk));
+  });
+  const child = Object.assign(new EventEmitter(), {
+    stdin,
+    stdout,
+    stderr,
+    pid,
+    exitCode: null,
+    kill() {
+      child.exitCode = 0;
+      child.emit('exit', 0, null);
+      return true;
+    },
+  });
+  return { child, stdout, inputs };
 }
 
 function tick() {
@@ -632,6 +656,47 @@ test('maps Claude Code text deltas and result into stream events', () => {
     session_id: 'claude-session-1',
     result: 'hello',
   }), { type: 'turn.completed' });
+});
+
+test('Claude runtime emits a runtime label from the init model', async () => {
+  const spawned = createClaudeChildHarness(3456);
+  const runtime = new ClaudeCodeRuntime({
+    env: {},
+    spawnFn: () => spawned.child,
+  });
+  const policy = buildRuntimePolicy({
+    env: {},
+    workingDirectory: '/tmp/project',
+    sandboxMode: 'workspace-write',
+    approvalPolicy: 'never',
+  });
+  const thread = runtime.startThread(policy);
+  const { events } = await thread.runStreamed('hello');
+  const collected = collectEvents(events);
+  await tick();
+
+  spawned.stdout.write(JSON.stringify({
+    type: 'system',
+    subtype: 'init',
+    session_id: 'claude-session-1',
+    model: 'sonnet',
+    claude_code_version: '2.1.234',
+  }) + '\n');
+  spawned.stdout.write(JSON.stringify({
+    type: 'result',
+    subtype: 'success',
+    is_error: false,
+    session_id: 'claude-session-1',
+  }) + '\n');
+  spawned.child.exitCode = 0;
+  spawned.stdout.end();
+
+  assert.deepEqual(await collected, [
+    { type: 'runtime.updated', runtimeLabel: 'ClaudeCode/sonnet' },
+    { type: 'turn.completed' },
+  ]);
+  assert.equal(thread.id, 'claude-session-1');
+  assert.equal(spawned.inputs.join(''), 'hello\n');
 });
 
 test('maps Claude Code tool use into command execution events', () => {

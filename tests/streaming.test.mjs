@@ -11,6 +11,7 @@ import {
   formatStreamState,
   markStreamInterrupted,
   redact,
+  shouldUpdateCard,
   updateStreamState,
 } from '../dist/streaming.js';
 
@@ -82,6 +83,19 @@ test('formats agent card with runtime label', () => {
 
   assert.equal(card.header.title.content, 'ClaudeCode/sonnet 正在处理');
   assert.match(formatStreamState(state), /ClaudeCode\/sonnet 正在处理/);
+});
+
+test('updates agent card runtime label from runtime events', () => {
+  const state = createStreamState('hi', 'running', 'ClaudeCode');
+  const next = updateStreamState(state, {
+    type: 'runtime.updated',
+    runtimeLabel: 'ClaudeCode/sonnet',
+  });
+  const card = buildAgentCard(next);
+
+  assert.equal(next.runtimeLabel, 'ClaudeCode/sonnet');
+  assert.equal(card.header.title.content, 'ClaudeCode/sonnet 正在处理');
+  assert.equal(shouldUpdateCard(state, next, 0), true);
 });
 
 test('keeps final response and completed mcp timeline', () => {
