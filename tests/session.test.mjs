@@ -1,9 +1,14 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 import {
   bindSessionThreadRecord,
   buildSessionRecord,
   clearRuntimeSessionId,
+  listClaudeProjectThreads,
+  listRuntimeSessionThreads,
   makeSessionKey,
   normalizeSessionMap,
   runtimeSessionIdField,
@@ -187,4 +192,115 @@ test('binding a selected desktop thread does not change Claude session id', () =
 
   assert.equal(next.codex_thread_id, 'codex-thread-2');
   assert.equal(next.claude_session_id, 'claude-session-1');
+});
+
+test('binding a selected Claude session writes the Claude session field only', () => {
+  const previous = {
+    session_key: 'chat:open',
+    chat_id: 'chat',
+    sender_open_id: 'open',
+    codex_thread_id: 'codex-thread-1',
+    claude_session_id: 'claude-session-1',
+    model: 'sonnet',
+    updated_at: '2026-08-29T00:00:00.000Z',
+  };
+
+  const next = bindSessionThreadRecord({
+    sessionKey: 'chat:open',
+    threadId: 'claude-session-2',
+    previous,
+    title: 'Claude 会话',
+    runtimeKind: 'claude-code',
+  });
+
+  assert.equal(next.codex_thread_id, 'codex-thread-1');
+  assert.equal(next.claude_session_id, 'claude-session-2');
+  assert.equal(next.title, 'Claude 会话');
+  assert.equal(next.model, 'sonnet');
+});
+
+test('lists stored Claude sessions as thread picker candidates', () => {
+  const sessions = {
+    'chat-a:open-a': {
+      session_key: 'chat-a:open-a',
+      chat_id: 'chat-a',
+      sender_open_id: 'open-a',
+      claude_session_id: 'claude-session-a',
+      title: 'README 调整',
+      updated_at: '2026-08-29T02:00:00.000Z',
+    },
+    'chat-b:open-b': {
+      session_key: 'chat-b:open-b',
+      chat_id: 'chat-b',
+      sender_open_id: 'open-b',
+      claude_session_id: 'claude-session-b',
+      title: '其他任务',
+      updated_at: '2026-08-29T03:00:00.000Z',
+    },
+    'chat-c:open-c': {
+      session_key: 'chat-c:open-c',
+      chat_id: 'chat-c',
+      sender_open_id: 'open-c',
+      codex_thread_id: 'codex-thread-c',
+      title: 'README Codex',
+      updated_at: '2026-08-29T04:00:00.000Z',
+    },
+  };
+
+  const threads = listRuntimeSessionThreads(sessions, 'claude-code', {
+    searchTerm: 'readme',
+    limit: 1,
+  });
+
+  assert.deepEqual(threads, [{
+    id: 'claude-session-a',
+    title: 'README 调整',
+    preview: 'chat-a:open-a',
+    cwd: '',
+    source: 'claude-code',
+    status: 'idle',
+    updatedAt: Date.parse('2026-08-29T02:00:00.000Z'),
+  }]);
+});
+
+test('lists Claude project JSONL history as thread picker candidates', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-projects-'));
+  const projectDir = path.join(root, '-tmp-project');
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.writeFileSync(path.join(projectDir, 'session-a.jsonl'), [
+    JSON.stringify({
+      type: 'user',
+      sessionId: 'session-a',
+      timestamp: '2026-08-29T02:00:00.000Z',
+      cwd: '/tmp/project',
+      message: { role: 'user', content: 'older prompt' },
+    }),
+    JSON.stringify({
+      type: 'last-prompt',
+      sessionId: 'session-a',
+      lastPrompt: 'Fix README threads',
+    }),
+  ].join('\n'));
+  fs.writeFileSync(path.join(projectDir, 'session-b.jsonl'), JSON.stringify({
+    type: 'user',
+    sessionId: 'session-b',
+    timestamp: '2026-08-29T03:00:00.000Z',
+    cwd: '/tmp/project',
+    message: { role: 'user', content: 'other prompt' },
+  }));
+
+  const threads = listClaudeProjectThreads(root, {
+    searchTerm: 'readme',
+    limit: 1,
+  });
+
+  assert.deepEqual(threads, [{
+    id: 'session-a',
+    title: 'Fix README threads',
+    preview: 'Fix README threads',
+    cwd: '/tmp/project',
+    source: 'claude-code',
+    status: 'idle',
+    updatedAt: Date.parse('2026-08-29T02:00:00.000Z'),
+  }]);
 });

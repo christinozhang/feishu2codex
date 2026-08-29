@@ -5,7 +5,7 @@ import * as path from 'path';
 import { spawnSync } from 'child_process';
 import { getRunPolicy, requiresFeishuApproval } from './approval.js';
 import { applyCodexResourceEnv, buildRuntimePolicy, buildRuntimeRetryParams, CodexRuntime, CodexRuntimeKind, CodexThreadHandle, createCodexRuntime, isRetryableThreadError, isRuntimeConnectionClosedEvent, loadCodexResourceLimits, runtimeDisplayNameForKind, selectCodexRuntimeKind, shouldFlushFinalStreamState } from './runtime.js';
-import { bindSessionThreadRecord, buildSessionRecord, clearRuntimeSessionId, makeSessionKey, normalizeSessionMap, runtimeSessionIdField, SessionRecord } from './session.js';
+import { bindSessionThreadRecord, buildSessionRecord, clearRuntimeSessionId, listClaudeProjectThreads, listRuntimeSessionThreads, makeSessionKey, mergeRuntimeThreads, normalizeSessionMap, runtimeSessionIdField, SessionRecord } from './session.js';
 import { startWebServer, updateStats, addLog } from './server.js';
 import {
     buildAgentCard,
@@ -371,6 +371,21 @@ async function handleSlashCommand(userText: string, params: {
         return { handled: true };
     }
     if (command.name === 'threads') {
+        if (codexRuntime.kind === 'claude-code' && !codexRuntime.listThreads) {
+            const storedThreads = listRuntimeSessionThreads(sessionMap, codexRuntime.kind, { searchTerm: command.args, limit: 20 });
+            const nativeThreads = listClaudeProjectThreads(undefined, { searchTerm: command.args, limit: 20 });
+            const threads = mergeRuntimeThreads([storedThreads, nativeThreads], 10);
+            await replyInteractiveCard(params.messageId, buildThreadPickerCard({
+                sessionKey: params.sessionKey,
+                requesterOpenId: params.senderOpenId,
+                sourceMessageId: params.messageId,
+                searchTerm: command.args,
+                runtimeKind: codexRuntime.kind,
+                runtimeLabel: runtimeDisplayName(codexRuntime.kind, getSessionModel(params.sessionKey)),
+                threads,
+            }), formatThreadPickerText(threads, command.args, codexRuntime.kind));
+            return { handled: true };
+        }
         if (!codexRuntime.listThreads) {
             await replyText(params.messageId, '当前 runtime 不支持 Desktop 对话检索。请使用 CODEX_RUNTIME=app-server。');
             return { handled: true };
@@ -382,8 +397,10 @@ async function handleSlashCommand(userText: string, params: {
                 requesterOpenId: params.senderOpenId,
                 sourceMessageId: params.messageId,
                 searchTerm: command.args,
+                runtimeKind: codexRuntime.kind,
+                runtimeLabel: runtimeDisplayName(codexRuntime.kind, getSessionModel(params.sessionKey)),
                 threads,
-            }), formatThreadPickerText(threads, command.args));
+            }), formatThreadPickerText(threads, command.args, codexRuntime.kind));
         } catch (e) {
             const message = e instanceof Error ? e.message : String(e);
             await replyText(params.messageId, `检索 Codex Desktop 对话失败: ${message}`);
@@ -676,6 +693,7 @@ async function handleBindThreadCardAction(value: any, senderOpenId: string) {
     const requesterOpenId = value.requester_open_id || value.requesterOpenId || senderOpenId;
     const sourceMessageId = value.source_message_id || value.sourceMessageId;
     const title = value.thread_title || value.threadTitle;
+    const runtimeKind = value.runtime_kind || value.runtimeKind || codexRuntime.kind;
     if (!sessionKey || !threadId) return;
     if (requesterOpenId !== 'unknown' && senderOpenId !== 'unknown' && requesterOpenId !== senderOpenId) {
         if (sourceMessageId) await replyText(sourceMessageId, '只有检索发起人可以绑定此对话。');
@@ -687,12 +705,14 @@ async function handleBindThreadCardAction(value: any, senderOpenId: string) {
         threadId,
         previous: sessionMap[sessionKey],
         title,
+        runtimeKind,
     });
     threadMap.delete(sessionKey);
     saveSessions();
     updateStats({ sessions: Object.keys(sessionMap).length });
-    addLog('info', `会话绑定 Desktop thread: ${sessionKey} -> ${threadId}`);
-    if (sourceMessageId) await replyText(sourceMessageId, `已绑定 Codex Desktop 对话: ${threadId}`);
+    addLog('info', `会话绑定 ${runtimeKind}: ${sessionKey} -> ${threadId}`);
+    const label = runtimeKind === 'claude-code' ? 'Claude Code 会话' : 'Codex Desktop 对话';
+    if (sourceMessageId) await replyText(sourceMessageId, `已绑定 ${label}: ${threadId}`);
 }
 
 async function handleQueueCardAction(action: string, value: any, senderOpenId: string) {

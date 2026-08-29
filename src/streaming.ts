@@ -296,15 +296,20 @@ export function buildThreadPickerCard(params: {
     requesterOpenId: string;
     sourceMessageId: string;
     searchTerm?: string;
+    runtimeKind?: string;
+    runtimeLabel?: string;
     threads: CodexThreadSummary[];
 }) {
     const elements: any[] = [];
     const search = params.searchTerm?.trim();
+    const isClaude = params.runtimeKind === 'claude-code';
+    const headerTitle = isClaude ? `${params.runtimeLabel || 'ClaudeCode'} 会话` : 'Codex Desktop 对话';
+    const emptyText = isClaude ? '未找到可绑定的 Claude Code 会话。' : '未找到可绑定的 Codex Desktop 对话。';
     elements.push({
         tag: 'markdown',
         content: [
             search ? `**检索词**\n${formatCardMarkdown(search, 120)}` : '',
-            params.threads.length === 0 ? '未找到可绑定的 Codex Desktop 对话。' : `共 ${params.threads.length} 条候选。`,
+            params.threads.length === 0 ? emptyText : `共 ${params.threads.length} 条候选。`,
         ].filter(Boolean).join('\n\n'),
     });
 
@@ -328,6 +333,7 @@ export function buildThreadPickerCard(params: {
         } else {
             elements.push(buildCallbackButton('继续此对话', 'primary', {
                 action: 'bind_thread',
+                runtime_kind: params.runtimeKind || 'app-server',
                 session_key: params.sessionKey,
                 requester_open_id: params.requesterOpenId,
                 source_message_id: params.sourceMessageId,
@@ -338,14 +344,15 @@ export function buildThreadPickerCard(params: {
     }
 
     return buildCard(
-        { template: 'blue', title: { tag: 'plain_text', content: 'Codex Desktop 对话' } },
+        { template: 'blue', title: { tag: 'plain_text', content: headerTitle } },
         elements,
     );
 }
 
-export function formatThreadPickerText(threads: CodexThreadSummary[], searchTerm = '') {
+export function formatThreadPickerText(threads: CodexThreadSummary[], searchTerm = '', runtimeKind?: string) {
+    const sourceLabel = runtimeKind === 'claude-code' ? 'Claude Code 会话' : 'Codex Desktop 对话';
     if (threads.length === 0) {
-        return searchTerm ? `未找到匹配 Codex Desktop 对话: ${searchTerm}` : '未找到 Codex Desktop 对话';
+        return searchTerm ? `未找到匹配 ${sourceLabel}: ${searchTerm}` : `未找到 ${sourceLabel}`;
     }
     return threads.map((thread, index) => [
         `${index + 1}. ${thread.title || thread.preview || thread.id}`,
@@ -357,6 +364,8 @@ export function formatThreadPickerText(threads: CodexThreadSummary[], searchTerm
 
 function formatThreadSourceForDisplay(source: string) {
     if (source === 'vscode') return 'Codex Desktop/IDE';
+    if (source === 'claude-code') return 'Claude Code';
+    if (source === 'bot-session') return '本地会话';
     return source || 'unknown';
 }
 

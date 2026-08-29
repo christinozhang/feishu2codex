@@ -30,7 +30,7 @@ export function slashHelpText() {
         '/mcp 查看 Codex CLI 可见 MCP；Claude Code MCP 查询尚未实现',
         '/approval 查看审批策略',
         '/queue 查看当前会话队列',
-        '/threads [keyword] 检索 Codex app-server 对话并绑定到当前飞书会话',
+        '/threads [keyword] 检索当前 runtime 可绑定会话；Claude Code 使用本地 session',
         '/interrupt <task> 打断当前任务并执行新任务',
         '/cancel <task_id> 取消等待任务',
         '/clear-queue 清空当前会话等待队列',

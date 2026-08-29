@@ -433,6 +433,32 @@ test('thread picker card renders bind buttons for desktop threads', () => {
   assert.equal(button.behaviors[0].value.session_key, 'chat:user');
 });
 
+test('thread picker card carries Claude runtime binding metadata', () => {
+  const card = buildThreadPickerCard({
+    sessionKey: 'chat:user',
+    requesterOpenId: 'user',
+    sourceMessageId: 'msg-1',
+    runtimeKind: 'claude-code',
+    runtimeLabel: 'ClaudeCode',
+    threads: [{
+      id: 'claude-session-1',
+      title: 'Claude 会话',
+      preview: '查看 README',
+      cwd: '$HOME/code/feishu2codex',
+      source: 'claude-code',
+      status: 'idle',
+      updatedAt: 1780000000,
+    }],
+  });
+  const button = cardElements(card).find((item) => item.tag === 'button');
+
+  assert.equal(card.header.title.content, 'ClaudeCode 会话');
+  assert.match(markdownText(card), /来源: Claude Code/);
+  assert.equal(button.behaviors[0].value.action, 'bind_thread');
+  assert.equal(button.behaviors[0].value.runtime_kind, 'claude-code');
+  assert.equal(button.behaviors[0].value.thread_id, 'claude-session-1');
+});
+
 test('thread picker text renders user-facing source labels', () => {
   const text = formatThreadPickerText([{
     id: 'thread-1',
@@ -446,6 +472,12 @@ test('thread picker text renders user-facing source labels', () => {
 
   assert.match(text, /来源: Codex Desktop\/IDE/);
   assert.doesNotMatch(text, /来源: vscode/);
+});
+
+test('thread picker text reports empty Claude sessions', () => {
+  const text = formatThreadPickerText([], 'readme', 'claude-code');
+
+  assert.equal(text, '未找到匹配 Claude Code 会话: readme');
 });
 
 test('card response renders inline code as Feishu neutral text tags and keeps fenced code language', () => {

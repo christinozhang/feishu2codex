@@ -31,13 +31,15 @@
 - 普通问答和只读任务默认直接执行。
 - slash 命令支持 `/help`、`/skills`、`/skill`、`/mcp`、
   `/approval`、`/queue`、`/threads`、`/interrupt`、`/cancel`、
-  `/clear-queue`、`/model`、`/reset` 和 `/status`；其中 `/threads` 当前仅适用
-  `CODEX_RUNTIME=app-server`，`/mcp` 当前查询 Codex CLI。
+  `/clear-queue`、`/model`、`/reset` 和 `/status`；其中 `/threads` 在
+  `CODEX_RUNTIME=app-server` 下检索 Codex Desktop 对话，在
+  `CODEX_RUNTIME=claude-code` 下检索本地 Claude Code session 文件和
+  `~/.claude/projects` 历史。
 - 可选使用 Codex `app-server` runtime，让新建对话更容易出现在
   Codex Desktop 侧边栏中。
 - 可选使用 `claude-code` runtime，把 Claude Code `stream-json` 输出映射成同一套
   飞书卡片。
-- `/threads [keyword]` 可以检索 Codex Desktop 对话，并把选中的 thread 绑定到
+- `/threads [keyword]` 可以检索当前 runtime 可绑定会话，并把选中的会话绑定到
   当前飞书会话。
 - `/model [model_name] [reasoning_effort]` 可以查看或设置当前飞书会话模型；
   在 `claude-code` runtime 下会转换成 Claude Code `--model` 参数。
@@ -486,8 +488,10 @@ launchctl enable gui/$(id -u)/ai.feishu-claude-bot
 - `/mcp`：当前查看 Codex CLI 可见 MCP；Claude Code MCP 查询尚未实现。
 - `/approval`：查看审批策略。
 - `/queue`：查看当前任务和等待队列。
-- `/threads [keyword]`：当前仅在 `CODEX_RUNTIME=app-server` 下检索 Codex
-  Desktop 对话，并用卡片按钮绑定到当前飞书会话。
+- `/threads [keyword]`：在 `CODEX_RUNTIME=app-server` 下检索 Codex Desktop
+  对话；在 `CODEX_RUNTIME=claude-code` 下检索当前 session 文件和
+  `~/.claude/projects` 中的 Claude Code session。卡片按钮会把选中的会话绑定到
+  当前飞书会话。
 - `/interrupt <task>`：打断当前任务，并把新任务放到队首执行。
 - `/cancel <task_id>`：取消一个等待任务。
 - `/clear-queue`：清空当前会话中属于当前用户的等待任务。
@@ -571,8 +575,10 @@ Claude bot 的卡片标题默认显示 `ClaudeCode/{model} 正在处理`。启�
 CLAUDE_CODE_DISPLAY_NAME=ClaudeCode/team
 ```
 
-`/threads` 是 Codex `app-server` 的能力。Claude bot 没有 Codex Desktop thread
-列表协议，因此在 `claude-code` runtime 下不会提供 Desktop thread 选择。
+`/threads` 在 Claude bot 中合并两个来源：`BOT_SESSION_FILE` 中已有的
+`claude_session_id`，以及 `~/.claude/projects` 下的 Claude Code JSONL 历史。
+卡片按钮会把选中的 session 写回当前飞书会话的 `claude_session_id` 字段，不会
+修改 `codex_thread_id`。
 
 ### 验证 Claude Code 调用
 
